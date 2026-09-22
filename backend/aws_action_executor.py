@@ -42,6 +42,7 @@ SUPPORTED_ACTIONS = {
     "disable": {"lambda_function"},
     "delete": {
         "s3_bucket",
+        "s3_object",
         "ec2_instance",
         "rds_instance",
         "lambda_function",
@@ -83,6 +84,7 @@ def execute_aws_action(
 
     executors = {
         "s3_bucket": execute_s3,
+        "s3_object": execute_s3_object,
         "ec2_instance": execute_ec2,
         "rds_instance": execute_rds,
         "lambda_function": execute_lambda,
@@ -248,6 +250,64 @@ def execute_s3(
     raise ValueError(
         f"Unsupported S3 action: {action}"
     )
+
+
+# =====================================================
+# 1B. S3 OBJECT
+# =====================================================
+
+
+def execute_s3_object(
+    session_id: str,
+    action: str,
+    parameters: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Delete one object from an S3 bucket."""
+
+    if action != "delete":
+        raise ValueError(
+            f"Unsupported S3 object action: {action}"
+        )
+
+    client = get_aws_client(
+        session_id=session_id,
+        service_name="s3",
+    )
+
+    bucket_name = validate_identifier(
+        require_string(parameters, "bucket_name"),
+        "bucket_name",
+    )
+
+    object_key = require_string(
+        parameters,
+        "object_key",
+    )
+
+    if len(object_key) > 1024:
+        raise ValueError("object_key is too long")
+
+    confirmation_identifier = f"{bucket_name}/{object_key}"
+
+    require_delete_confirmation(
+        parameters,
+        confirmation_identifier,
+    )
+
+    client.delete_object(
+        Bucket=bucket_name,
+        Key=object_key,
+    )
+
+    return {
+        "success": True,
+        "service": "s3",
+        "resource_type": "s3_object",
+        "action": "delete",
+        "bucket_name": bucket_name,
+        "object_key": object_key,
+        "message": "S3 object deletion request completed successfully",
+    }
 
 
 # =====================================================

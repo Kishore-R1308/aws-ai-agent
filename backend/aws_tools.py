@@ -827,3 +827,193 @@ def get_inspector_findings(session_id, query=None):
     }
 
  
+# ---------------------------------------------------------------------------
+# Resource detail and operational helper functions
+# ---------------------------------------------------------------------------
+
+def _resource_tags(resource):
+    return {
+        tag.get("Key"): tag.get("Value")
+        for tag in resource.get("Tags", [])
+        if tag.get("Key")
+    }
+
+
+def get_ec2_instance_details(session_id: str, instance_id: str):
+    ec2 = get_aws_client(session_id, "ec2")
+    response = ec2.describe_instances(InstanceIds=[instance_id])
+    instances = [
+        instance
+        for reservation in response.get("Reservations", [])
+        for instance in reservation.get("Instances", [])
+    ]
+    if not instances:
+        return {"error": f"EC2 instance not found: {instance_id}"}
+
+    instance = instances[0]
+    return {
+        "instance_id": instance.get("InstanceId"),
+        "state": instance.get("State", {}).get("Name"),
+        "state_code": instance.get("State", {}).get("Code"),
+        "instance_type": instance.get("InstanceType"),
+        "image_id": instance.get("ImageId"),
+        "launch_time": str(instance.get("LaunchTime")),
+        "private_ip": instance.get("PrivateIpAddress"),
+        "public_ip": instance.get("PublicIpAddress"),
+        "private_dns": instance.get("PrivateDnsName"),
+        "public_dns": instance.get("PublicDnsName"),
+        "subnet_id": instance.get("SubnetId"),
+        "vpc_id": instance.get("VpcId"),
+        "security_groups": instance.get("SecurityGroups", []),
+        "iam_instance_profile": instance.get("IamInstanceProfile"),
+        "monitoring": instance.get("Monitoring"),
+        "tags": _resource_tags(instance),
+    }
+
+
+def get_ec2_console_output(session_id: str, instance_id: str):
+    ec2 = get_aws_client(session_id, "ec2")
+    response = ec2.get_console_output(InstanceId=instance_id, Latest=True)
+    return {
+        "instance_id": instance_id,
+        "timestamp": str(response.get("Timestamp")),
+        "output": response.get("Output") or "No console output available.",
+    }
+
+
+def get_s3_objects(session_id: str, bucket_name: str, prefix: str = ""):
+    s3 = get_aws_client(session_id, "s3")
+    paginator = s3.get_paginator("list_objects_v2")
+    objects = []
+    for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            objects.append({
+                "key": obj.get("Key"),
+                "size": obj.get("Size"),
+                "last_modified": str(obj.get("LastModified")),
+                "etag": obj.get("ETag"),
+                "storage_class": obj.get("StorageClass"),
+            })
+    return objects
+
+
+def upload_s3_object(session_id: str, bucket_name: str, object_key: str, file_path: str,
+                     content_type: str | None = None):
+    s3 = get_aws_client(session_id, "s3")
+    extra_args = {"ContentType": content_type} if content_type else None
+    if extra_args:
+        s3.upload_file(file_path, bucket_name, object_key, ExtraArgs=extra_args)
+    else:
+        s3.upload_file(file_path, bucket_name, object_key)
+    return {"bucket": bucket_name, "key": object_key, "status": "uploaded"}
+
+
+def download_s3_object(session_id: str, bucket_name: str, object_key: str, file_path: str):
+    s3 = get_aws_client(session_id, "s3")
+    s3.download_file(bucket_name, object_key, file_path)
+    return {"bucket": bucket_name, "key": object_key, "file_path": file_path, "status": "downloaded"}
+
+
+def delete_s3_object(session_id: str, bucket_name: str, object_key: str):
+    s3 = get_aws_client(session_id, "s3")
+    s3.delete_object(Bucket=bucket_name, Key=object_key)
+    return {"bucket": bucket_name, "key": object_key, "status": "deleted"}
+
+
+def get_rds_instance_details(session_id: str, identifier: str):
+    rds = get_aws_client(session_id, "rds")
+    response = rds.describe_db_instances(DBInstanceIdentifier=identifier)
+    instances = response.get("DBInstances", [])
+    if not instances:
+        return {"error": f"RDS instance not found: {identifier}"}
+
+    db = instances[0]
+    endpoint = db.get("Endpoint") or {}
+    return {
+        "identifier": db.get("DBInstanceIdentifier"),
+        "status": db.get("DBInstanceStatus"),
+        "engine": db.get("Engine"),
+        "engine_version": db.get("EngineVersion"),
+        "instance_class": db.get("DBInstanceClass"),
+        "allocated_storage": db.get("AllocatedStorage"),
+        "availability_zone": db.get("AvailabilityZone"),
+        "multi_az": db.get("MultiAZ"),
+        "publicly_accessible": db.get("PubliclyAccessible"),
+        "endpoint": endpoint.get("Address"),
+        "port": endpoint.get("Port"),
+        "vpc_id": db.get("DBSubnetGroup", {}).get("VpcId"),
+        "security_groups": db.get("VpcSecurityGroups", []),
+        "backup_retention_period": db.get("BackupRetentionPeriod"),
+        "preferred_backup_window": db.get("PreferredBackupWindow"),
+        "preferred_maintenance_window": db.get("PreferredMaintenanceWindow"),
+    }
+
+
+def get_rds_events(session_id: str, identifier: str | None = None, duration_minutes: int = 1440):
+    rds = get_aws_client(session_id, "rds")
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(minutes=duration_minutes)
+    params = {"SourceType": "db-instance", "StartTime": start_time, "EndTime": end_time}
+    if identifier:
+        params["SourceIdentifier"] = identifier
+    response = rds.describe_events(**params)
+    return response.get("Events", [])
+
+
+def get_lambda_function_details(session_id: str, function_name: str):
+    lambda_client = get_aws_client(session_id, "lambda")
+    response = lambda_client.get_function(FunctionName=function_name)
+    configuration = response.get("Configuration", {})
+    return {
+        "function_name": configuration.get("FunctionName"),
+        "runtime": configuration.get("Runtime"),
+        "handler": configuration.get("Handler"),
+        "memory_size": configuration.get("MemorySize"),
+        "timeout": configuration.get("Timeout"),
+        "state": configuration.get("State"),
+        "last_modified": configuration.get("LastModified"),
+        "version": configuration.get("Version"),
+        "role": configuration.get("Role"),
+        "description": configuration.get("Description"),
+        "environment_variables": configuration.get("Environment", {}).get("Variables", {}),
+        "arn": configuration.get("FunctionArn"),
+        "code_size": configuration.get("CodeSize"),
+    }
+
+
+def get_lambda_logs(session_id: str, function_name: str, limit: int = 100):
+    logs = get_aws_client(session_id, "logs")
+    log_group = f"/aws/lambda/{function_name}"
+    response = logs.filter_log_events(logGroupName=log_group, limit=min(max(limit, 1), 10000))
+    return {
+        "log_group": log_group,
+        "events": response.get("events", []),
+        "next_token": response.get("nextToken"),
+    }
+
+
+def get_vpc_details(session_id: str, vpc_id: str):
+    ec2 = get_aws_client(session_id, "ec2")
+    response = ec2.describe_vpcs(VpcIds=[vpc_id])
+    vpcs = response.get("Vpcs", [])
+    if not vpcs:
+        return {"error": f"VPC not found: {vpc_id}"}
+    vpc = vpcs[0]
+    return {
+        "vpc_id": vpc.get("VpcId"),
+        "cidr_block": vpc.get("CidrBlock"),
+        "state": vpc.get("State"),
+        "is_default": vpc.get("IsDefault"),
+        "dhcp_options_id": vpc.get("DhcpOptionsId"),
+        "instance_tenancy": vpc.get("InstanceTenancy"),
+        "tags": _resource_tags(vpc),
+    }
+
+
+def get_security_group_details(session_id: str, group_id: str):
+    ec2 = get_aws_client(session_id, "ec2")
+    response = ec2.describe_security_groups(GroupIds=[group_id])
+    groups = response.get("SecurityGroups", [])
+    if not groups:
+        return {"error": f"Security group not found: {group_id}"}
+    return groups[0]

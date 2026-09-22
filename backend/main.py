@@ -1029,3 +1029,263 @@ def confirm_rca_action_batch(
             request.batch_id
         ),
     }
+# =====================================================
+# LIVE RESOURCE DETAIL AND CONTENT APIs
+# =====================================================
+
+import base64
+from datetime import datetime
+from typing import Optional
+
+from fastapi import Body, Query
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from aws_auth import get_aws_client
+
+
+class S3UploadRequest(BaseModel):
+    bucket_name: str = Field(min_length=3, max_length=63)
+    object_key: str = Field(min_length=1, max_length=1024)
+    content_base64: str = Field(min_length=1)
+    content_type: str = Field(default="application/octet-stream", max_length=255)
+
+
+class S3DownloadRequest(BaseModel):
+    bucket_name: str = Field(min_length=3, max_length=63)
+    object_key: str = Field(min_length=1, max_length=1024)
+
+
+def _resource_client(session_id: str, service_name: str):
+    validate_aws_session(session_id)
+    return get_aws_client(session_id=session_id, service_name=service_name)
+
+
+@app.get("/aws/resource/details/{session_id}")
+def get_resource_details(
+    session_id: str,
+    service: str = Query(...),
+    resource_id: str = Query(..., min_length=1),
+):
+    """Return fresh technical details for one selected AWS resource."""
+    try:
+        if service == "ec2":
+            client = _resource_client(session_id, "ec2")
+            response = client.describe_instances(InstanceIds=[resource_id])
+            instances = [
+                instance
+                for reservation in response.get("Reservations", [])
+                for instance in reservation.get("Instances", [])
+            ]
+            if not instances:
+                raise HTTPException(status_code=404, detail="EC2 instance not found")
+            return {"service": service, "resource_id": resource_id, "details": instances[0]}
+
+        if service == "s3":
+            client = _resource_client(session_id, "s3")
+            location = client.get_bucket_location(Bucket=resource_id).get("LocationConstraint")
+            return {
+                "service": service,
+                "resource_id": resource_id,
+                "details": {
+                    "bucket_name": resource_id,
+                    "region": location or "us-east-1",
+                    "head": client.head_bucket(Bucket=resource_id),
+                },
+            }
+
+        if service == "rds":
+            client = _resource_client(session_id, "rds")
+            response = client.describe_db_instances(DBInstanceIdentifier=resource_id)
+            instances = response.get("DBInstances", [])
+            if not instances:
+                raise HTTPException(status_code=404, detail="RDS instance not found")
+            return {"service": service, "resource_id": resource_id, "details": instances[0]}
+
+        if service == "lambda":
+            client = _resource_client(session_id, "lambda")
+            response = client.get_function_configuration(FunctionName=resource_id)
+            return {"service": service, "resource_id": resource_id, "details": response}
+
+        if service == "vpc":
+            client = _resource_client(session_id, "ec2")
+            response = client.describe_vpcs(VpcIds=[resource_id])
+            vpcs = response.get("Vpcs", [])
+            if not vpcs:
+                raise HTTPException(status_code=404, detail="VPC not found")
+            return {"service": service, "resource_id": resource_id, "details": vpcs[0]}
+
+        if service == "subnet":
+            client = _resource_client(session_id, "ec2")
+            response = client.describe_subnets(SubnetIds=[resource_id])
+            subnets = response.get("Subnets", [])
+            if not subnets:
+                raise HTTPException(status_code=404, detail="Subnet not found")
+            return {"service": service, "resource_id": resource_id, "details": subnets[0]}
+
+        if service == "security_group":
+            client = _resource_client(session_id, "ec2")
+            response = client.describe_security_groups(GroupIds=[resource_id])
+            groups = response.get("SecurityGroups", [])
+            if not groups:
+                raise HTTPException(status_code=404, detail="Security group not found")
+            return {"service": service, "resource_id": resource_id, "details": groups[0]}
+
+        raise HTTPException(status_code=400, detail=f"Unsupported service: {service}")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not load resource details: {exc}")
+
+
+@app.get("/aws/s3/objects/{session_id}")
+def list_s3_objects(
+    session_id: str,
+    bucket_name: str = Query(..., min_length=3, max_length=63),
+    prefix: str = Query(default="", max_length=1024),
+    max_keys: int = Query(default=100, ge=1, le=1000),
+):
+    """List objects inside a selected S3 bucket."""
+    try:
+        client = _resource_client(session_id, "s3")
+        response = client.list_objects_v2(Bucket=bucket_name, Prefix=prefix, MaxKeys=max_keys)
+        raw_objects = response.get("Contents", [])
+        # Normalize AWS's PascalCase response fields for the frontend.
+        objects = [
+            {
+                "key": item.get("Key"),
+                "size": item.get("Size", 0),
+                "etag": item.get("ETag"),
+                "last_modified": (
+                    item.get("LastModified").isoformat()
+                    if item.get("LastModified") is not None
+                    else None
+                ),
+                "storage_class": item.get("StorageClass"),
+            }
+            for item in raw_objects
+            if item.get("Key")
+        ]
+        return {
+            "bucket_name": bucket_name,
+            "prefix": prefix,
+            "is_truncated": response.get("IsTruncated", False),
+            "objects": objects,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not list S3 objects: {exc}")
+
+
+@app.post("/aws/s3/upload/{session_id}")
+def upload_s3_object(session_id: str, request: S3UploadRequest):
+    """Upload a base64-encoded file to an S3 bucket."""
+    try:
+        content = base64.b64decode(request.content_base64, validate=True)
+        if len(content) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Upload is limited to 10 MB")
+
+        client = _resource_client(session_id, "s3")
+        response = client.put_object(
+            Bucket=request.bucket_name,
+            Key=request.object_key,
+            Body=content,
+            ContentType=request.content_type,
+        )
+        return {
+            "success": True,
+            "bucket_name": request.bucket_name,
+            "object_key": request.object_key,
+            "etag": response.get("ETag"),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not upload S3 object: {exc}")
+
+
+@app.post("/aws/s3/download/{session_id}")
+def download_s3_object(session_id: str, request: S3DownloadRequest):
+    """Return an S3 object as base64 so the Streamlit frontend can save it."""
+    try:
+        client = _resource_client(session_id, "s3")
+        response = client.get_object(Bucket=request.bucket_name, Key=request.object_key)
+        content = response["Body"].read()
+        return {
+            "bucket_name": request.bucket_name,
+            "object_key": request.object_key,
+            "content_type": response.get("ContentType") or "application/octet-stream",
+            "content_base64": base64.b64encode(content).decode("ascii"),
+            "content_length": len(content),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not download S3 object: {exc}")
+
+
+@app.get("/aws/cloudwatch/logs/{session_id}")
+def get_cloudwatch_logs(
+    session_id: str,
+    log_group_name: str = Query(..., min_length=1, max_length=512),
+    log_stream_name: Optional[str] = Query(default=None, max_length=512),
+    limit: int = Query(default=50, ge=1, le=200),
+):
+    """Read recent CloudWatch log events for a supplied log group/stream."""
+    try:
+        client = _resource_client(session_id, "logs")
+        if not log_stream_name:
+            streams_response = client.describe_log_streams(
+                logGroupName=log_group_name,
+                orderBy="LastEventTime",
+                descending=True,
+                limit=1,
+            )
+            streams = streams_response.get("logStreams", [])
+            if not streams:
+                return {"log_group_name": log_group_name, "events": [], "message": "No log streams found"}
+            log_stream_name = streams[0].get("logStreamName")
+
+        response = client.get_log_events(
+            logGroupName=log_group_name,
+            logStreamName=log_stream_name,
+            limit=limit,
+            startFromHead=False,
+        )
+        return {
+            "log_group_name": log_group_name,
+            "log_stream_name": log_stream_name,
+            "events": response.get("events", []),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not load CloudWatch logs: {exc}")
+
+# =====================================================
+# S3 OBJECT DELETE
+# =====================================================
+
+@app.delete("/aws/s3/objects/{session_id}")
+def delete_s3_object(
+    session_id: str,
+    bucket_name: str = Query(..., min_length=3, max_length=63),
+    object_key: str = Query(..., min_length=1, max_length=1024),
+):
+    """Delete one object from an S3 bucket after frontend confirmation."""
+    try:
+        client = _resource_client(session_id, "s3")
+
+        client.delete_object(
+            Bucket=bucket_name,
+            Key=object_key,
+        )
+
+        return {
+            "success": True,
+            "bucket_name": bucket_name,
+            "object_key": object_key,
+            "message": "S3 object deleted successfully.",
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not delete S3 object: {exc}",
+        )
+

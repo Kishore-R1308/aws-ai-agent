@@ -87,6 +87,66 @@ st.markdown(
         font-weight: 700;
         margin: 0.4rem 0 0.7rem 0;
     }
+
+    .resource-card-title {
+        font-size: 1.45rem;
+        font-weight: 800;
+        color: #172554;
+        margin: 0;
+    }
+
+    .resource-action-heading {
+        display: flex;
+        align-items: center;
+        gap: 0.45rem;
+        color: #172554;
+        font-size: 1.15rem;
+        font-weight: 800;
+        margin: 0.35rem 0 0.7rem 0;
+    }
+
+    .resource-action-caption {
+        color: #64748b;
+        font-size: 0.86rem;
+        margin-top: -0.35rem;
+        margin-bottom: 0.8rem;
+    }
+
+    .metric-label {
+        color: #64748b;
+        font-size: 0.8rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+    }
+
+    .metric-value {
+        color: #172554;
+        font-size: 1.8rem;
+        font-weight: 800;
+        line-height: 1.2;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    """
+    <style>
+    .resource-page-header { padding: 0.4rem 0 1.1rem 0; }
+    .resource-page-header h1 { margin: 0; font-size: 2.35rem; letter-spacing: -0.04em; }
+    .resource-page-header p { margin: 0.35rem 0 0 0; color: #71809b; font-size: 1rem; }
+    .eyebrow { color: #2563eb; font-size: 0.72rem; font-weight: 800; letter-spacing: 0.14em; margin-bottom: 0.25rem; }
+    .resource-section-title { display: flex; justify-content: space-between; align-items: center; margin: 1.2rem 0 0.8rem 0; font-size: 1.35rem; font-weight: 800; }
+    .resource-count { color: #71809b; font-size: 0.85rem; font-weight: 600; }
+    .resource-divider { height: 1px; background: rgba(120, 135, 160, 0.25); margin: 1rem 0; }
+    .detail-label { color: #71809b !important; font-size: 0.78rem !important; font-weight: 600; }
+    .detail-value { color: #14213d !important; font-size: 0.96rem !important; font-weight: 650 !important; }
+    .status-running, .status-stopped, .status-other { border-radius: 999px; padding: 0.3rem 0.65rem; text-align: center; font-size: 0.78rem; font-weight: 750; }
+    .status-running { background: #e2f8ed; color: #07834f; }
+    .status-stopped { background: #ffe7e7; color: #c62828; }
+    .status-other { background: #fff4d6; color: #9a6700; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -611,6 +671,9 @@ def post_action_plan(action_type, resource_type, parameters, explanation):
 
         st.session_state.pending_action_id = action_id
         st.session_state.pending_action_payload = payload
+        # Reuse the existing secure confirmation screen for actions initiated
+        # from Live Resources as well as the Create / Delete page.
+        st.session_state.resource_page = "Create Resource"
         st.success("Action prepared. Review and confirm it below.")
         st.rerun()
 
@@ -759,169 +822,202 @@ def render_resource_fields(action_type, resource_type):
 
 
 def display_single_action_manager():
-    """Dynamic create/delete AWS resource form with confirmation."""
-    st.header("⚙️ Create / Delete Resource")
+    """Professional create-only AWS resource workflow.
 
-    action_type = st.radio(
-        "Choose operation",
-        ["create", "delete"],
-        horizontal=True,
-        key="resource_action_type",
-    )
-
-    resource_options = {
-        "S3 Bucket": "s3_bucket",
-        "EC2 Instance": "ec2_instance",
-        "RDS Instance": "rds_instance",
-        "Lambda Function": "lambda_function",
-        "Security Group": "security_group",
-        "VPC": "vpc",
-        "Subnet": "subnet",
-        "IAM Resource": "iam_resource",
-    }
-
-    resource_label = st.selectbox(
-        "Choose AWS resource",
-        list(resource_options.keys()),
-        key="resource_type_label",
-    )
-    resource_type = resource_options[resource_label]
-
-    st.info(
-        "Fill in the required fields. The action will not execute until "
-        "you enter the exact confirmation phrase."
-    )
-
-    with st.form("dynamic_resource_action_form", clear_on_submit=False):
-        parameters = render_resource_fields(action_type, resource_type)
-        explanation = st.text_area(
-            "Reason for this action",
-            value=f"User requested {action_type} for {resource_label}.",
-            key="resource_explanation",
-        )
-        submitted = st.form_submit_button(
-            "📋 Review Action",
-            use_container_width=True,
+    Destructive delete actions are intentionally available only from the
+    Live Resources page, where the selected live resource is known.
+    """
+    if not st.session_state.get("pending_action_id"):
+        st.markdown(
+            """
+            <div class="resource-page-header">
+                <div class="eyebrow">RESOURCE OPERATIONS</div>
+                <h1>⚙️ Create AWS Resource</h1>
+                <p>Create AWS resources through a controlled review and confirmation workflow. Delete actions are available from Live Resources.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
-    if submitted:
-        missing = [
-            key for key, value in parameters.items()
-            if isinstance(value, str) and not value.strip()
-        ]
+        resource_options = {
+            "S3 Bucket": "s3_bucket",
+            "EC2 Instance": "ec2_instance",
+            "RDS Instance": "rds_instance",
+            "Lambda Function": "lambda_function",
+            "Security Group": "security_group",
+            "VPC": "vpc",
+            "Subnet": "subnet",
+            "IAM Resource": "iam_resource",
+        }
 
-        if resource_type == "ec2_instance" and action_type == "create":
-            for required_key in ("image_id", "instance_type"):
-                if not parameters.get(required_key):
-                    missing.append(required_key)
+        with st.container(border=True):
+            st.markdown("### Choose an operation")
+            st.caption("Select the operation and AWS resource you want to manage.")
 
-        if missing:
-            st.error("Please complete all required fields before continuing.")
-        else:
-            post_action_plan(
-                action_type,
-                resource_type,
-                parameters,
-                explanation,
+            action_type = "create"
+            st.success("Create mode is enabled. To delete a live resource, open Live Resources and use its Delete action.")
+
+            resource_label = st.selectbox(
+                    "AWS resource",
+                    list(resource_options.keys()),
+                    key="resource_type_label",
+                    format_func=lambda value: f"{get_service_icon(resource_options[value].replace('_instance', '').replace('_bucket', '').replace('_function', '').replace('_resource', ''))}  {value}",
+                )
+
+            resource_type = resource_options[resource_label]
+
+            st.info(
+                "Complete the required fields. AWS will not execute the creation "
+                "until you review and confirm it."
             )
+
+            st.markdown("### Resource configuration")
+            with st.form("dynamic_resource_action_form", clear_on_submit=False):
+                parameters = render_resource_fields(action_type, resource_type)
+                explanation = st.text_area(
+                    "Reason for this action",
+                    value=f"User requested {action_type} for {resource_label}.",
+                    key="resource_explanation",
+                    help="Explain why this operation is required for auditability.",
+                )
+
+                submitted = st.form_submit_button(
+                    "Review Action →",
+                    use_container_width=True,
+                    type="primary",
+                )
+
+        if submitted:
+            missing = [
+                key for key, value in parameters.items()
+                if isinstance(value, str) and not value.strip()
+            ]
+
+            if resource_type == "ec2_instance" and action_type == "create":
+                for required_key in ("ami_id", "instance_type", "key_name"):
+                    if not parameters.get(required_key):
+                        missing.append(required_key)
+
+            if missing:
+                st.error("Please complete all required fields before continuing.")
+            else:
+                post_action_plan(
+                    action_type,
+                    resource_type,
+                    parameters,
+                    explanation,
+                )
 
     pending_action_id = st.session_state.pending_action_id
     if pending_action_id:
-        st.divider()
-        st.subheader("🔐 Confirm AWS Action")
-        st.write("Review the planned action before execution.")
+        st.markdown("---")
+        st.markdown(
+            """
+            <div class="resource-page-header">
+                <div class="eyebrow">SECURITY CHECK</div>
+                <h2>🔐 Review and confirm</h2>
+                <p>Review the target and enter the exact confirmation phrase before execution.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("Clear pending action", key="clear_stale_pending_action"):
+            reset_pending_action()
+            st.rerun()
 
         payload = st.session_state.pending_action_payload or {}
-
-        # Show the planned action as a human-readable confirmation card
-        # instead of exposing the internal JSON payload.
         action = str(payload.get("action", "unknown")).upper()
         resource_type = str(payload.get("resource_type", "unknown"))
         parameters = payload.get("parameters") or {}
         explanation = payload.get("explanation")
 
-        info_col, resource_col = st.columns(2)
+        with st.container(border=True):
+            summary_col, target_col = st.columns(2, gap="large")
+            with summary_col:
+                st.caption("Operation")
+                st.markdown(f"### {action}")
+            with target_col:
+                st.caption("Resource")
+                st.markdown(f"### {resource_type.replace('_', ' ').title()}")
 
-        with info_col:
-            st.markdown("**Action**")
-            st.info(action)
-
-        with resource_col:
-            st.markdown("**Resource**")
-            st.info(resource_type.replace("_", " ").title())
-
-        st.markdown("**Target**")
-        if parameters:
-            for key, value in parameters.items():
-                label = key.replace("_", " ").title()
-                st.write(f"**{label}:** {value}")
-        else:
-            st.write("No additional parameters")
-
-        if explanation:
-            st.caption(f"Reason: {explanation}")
-
-        st.warning(
-            "This action can modify your live AWS environment. "
-            "Only confirm if you want AWS to perform this operation."
-        )
-
-        confirmation = st.text_input(
-            f"Type exactly: {CONFIRMATION_PHRASE}",
-            key="single_action_confirmation",
-        )
-
-        confirm_col, cancel_col = st.columns(2)
-
-        with confirm_col:
-            confirm_clicked = st.button(
-                "🚀 Confirm and Execute",
-                use_container_width=True,
-                key="confirm_dynamic_action",
-            )
-
-        with cancel_col:
-            cancel_clicked = st.button(
-                "❌ Cancel",
-                use_container_width=True,
-                key="cancel_dynamic_action",
-            )
-
-        if cancel_clicked:
-            reset_pending_action()
-            st.rerun()
-
-        if confirm_clicked:
-            if confirmation.strip() != CONFIRMATION_PHRASE:
-                st.error("Incorrect confirmation phrase.")
+            st.markdown("#### Target details")
+            if parameters:
+                sensitive_keys = {
+                    "master_password",
+                    "secret_key",
+                    "access_key",
+                    "password",
+                    "token",
+                }
+                for key, value in parameters.items():
+                    label = key.replace("_", " ").title()
+                    display_value = "••••••••" if key.lower() in sensitive_keys else value
+                    st.write(f"**{label}:** {display_value}")
             else:
-                try:
-                    with st.spinner("Executing AWS action..."):
-                        response = requests.post(
-                            f"{BACKEND_URL}/aws/action/confirm",
-                            json={
-                                "session_id": st.session_state.session_id,
-                                "action_id": pending_action_id,
-                                "confirmation_phrase": confirmation.strip(),
-                            },
-                            timeout=300,
-                        )
+                st.write("No additional parameters")
 
-                    if response.status_code == 200:
-                        st.success("AWS action execution completed.")
-                        st.json(response.json())
+            if explanation:
+                st.caption(f"Reason: {explanation}")
 
-                        # Keep the confirmation workflow only on the
-                        # Create / Delete page, but refresh the affected
-                        # service when the user opens Live Resources.
-                        mark_live_resources_for_refresh(resource_type)
-                        reset_pending_action()
-                        st.rerun()
-                    else:
-                        show_error(response, "AWS action execution failed.")
+            st.warning(
+                "This operation can modify your live AWS environment. "
+                "Confirm only when the target and parameters are correct."
+            )
 
-                except requests.exceptions.RequestException as exc:
-                    st.error(f"AWS action confirmation failed: {exc}")
+            confirmation = st.text_input(
+                f"Type exactly: {CONFIRMATION_PHRASE}",
+                key="single_action_confirmation",
+            )
+
+            confirm_col, cancel_col = st.columns(2, gap="medium")
+            with confirm_col:
+                confirm_clicked = st.button(
+                    "Confirm and Execute",
+                    use_container_width=True,
+                    key="confirm_dynamic_action",
+                    type="primary",
+                )
+
+            with cancel_col:
+                cancel_clicked = st.button(
+                    "Cancel",
+                    use_container_width=True,
+                    key="cancel_dynamic_action",
+                )
+
+            if cancel_clicked:
+                reset_pending_action()
+                st.rerun()
+
+            if confirm_clicked:
+                if confirmation.strip() != CONFIRMATION_PHRASE:
+                    st.error("Incorrect confirmation phrase.")
+                else:
+                    try:
+                        with st.spinner("Executing AWS action..."):
+                            response = requests.post(
+                                f"{BACKEND_URL}/aws/action/confirm",
+                                json={
+                                    "session_id": st.session_state.session_id,
+                                    "action_id": pending_action_id,
+                                    "confirmation_phrase": confirmation.strip(),
+                                },
+                                timeout=300,
+                            )
+
+                        if response.status_code == 200:
+                            st.success("AWS action execution completed.")
+                            st.json(response.json())
+                            mark_live_resources_for_refresh(resource_type)
+                            reset_pending_action()
+                            st.session_state.resource_page = "Live Resources"
+                            st.session_state["resource_page_selector"] = "Live Resources"
+                            st.rerun()
+                        else:
+                            show_error(response, "AWS action execution failed.")
+
+                    except requests.exceptions.RequestException as exc:
+                        st.error(f"AWS action confirmation failed: {exc}")
 
 
 # =====================================================
@@ -1362,17 +1458,44 @@ def resource_summary_fields(service, details):
     return []
 
 
-def get_live_resource_actions(service):
-    """Return actions supported by the current backend for an existing resource."""
-    return {
-        "ec2": ["start", "stop", "reboot", "delete"],
-        "s3": ["delete"],
-        "rds": ["start", "stop", "delete"],
-        "lambda": ["enable", "disable", "delete"],
-        "vpc": ["delete"],
-        "subnet": ["delete"],
-        "security_group": ["delete"],
-    }.get(service, [])
+def get_live_resource_actions(service, details=None):
+    """Return state-aware informational and executable resource actions."""
+    details = details or {}
+    if service == "ec2":
+        state = str(details.get("state") or "unknown").strip().lower()
+        actions = ["view_details"]
+        if state == "running":
+            actions += ["stop", "reboot", "view_logs"]
+        elif state == "stopped":
+            actions += ["start", "view_logs"]
+        elif state in {"pending", "stopping", "shutting-down"}:
+            actions += ["view_logs"]
+        elif state in {"terminated", "shutting_down"}:
+            actions += []
+        else:
+            actions += ["start", "view_logs"]
+        actions += ["delete"]
+        return actions
+    if service == "s3":
+        return ["view_details", "view_files", "upload_file", "download_file", "delete"]
+    if service == "rds":
+        state = str(details.get("status") or "unknown").lower()
+        actions = ["view_details"]
+        if state == "available":
+            actions += ["stop"]
+        elif state == "stopped":
+            actions += ["start"]
+        actions += ["view_logs", "delete"]
+        return actions
+    if service == "lambda":
+        return ["view_details", "enable", "disable", "view_logs", "delete"]
+    if service == "vpc":
+        return ["view_details", "delete"]
+    if service == "subnet":
+        return ["view_details", "delete"]
+    if service == "security_group":
+        return ["view_details", "view_rules", "delete"]
+    return ["view_details"]
 
 
 def build_live_resource_action(service, details, resource_id, resource_name, action):
@@ -1441,216 +1564,548 @@ def build_live_resource_action(service, details, resource_id, resource_name, act
     return resource_type, parameters
 
 
+def _backend_json_response(response, fallback_message):
+    """Safely parse a backend JSON response and show useful errors."""
+    if response.status_code >= 400:
+        try:
+            detail = response.json().get("detail", fallback_message)
+        except Exception:
+            detail = fallback_message
+        st.error(str(detail))
+        return None
+
+    try:
+        return response.json()
+    except ValueError:
+        st.error("The backend returned an invalid JSON response.")
+        return None
+
+
+def render_s3_object_tools(session_id, bucket_name, resource_key, mode="view_files"):
+    """Render reliable S3 listing, upload and download controls."""
+    import base64
+
+    status_key = f"s3_status_{resource_key}"
+    download_key = f"s3_download_data_{resource_key}"
+
+    if st.session_state.get(status_key):
+        st.success(st.session_state[status_key])
+        st.session_state[status_key] = None
+
+    # Upload is shown only for the Upload File action.
+    if mode == "upload_file":
+        st.markdown("#### Upload Object")
+        uploaded_file = st.file_uploader(
+            "Choose a file",
+            key=f"s3_upload_file_{resource_key}",
+        )
+        if uploaded_file is not None:
+            upload_key = st.text_input(
+                "Object key",
+                value=uploaded_file.name,
+                key=f"s3_upload_key_{resource_key}",
+            )
+            if st.button(
+                "⬆️ Upload Object",
+                key=f"s3_upload_submit_{resource_key}",
+                use_container_width=True,
+            ):
+                if not upload_key.strip():
+                    st.error("Object key is required.")
+                    return
+                try:
+                    payload = {
+                        "bucket_name": bucket_name,
+                        "object_key": upload_key.strip(),
+                        "content_base64": base64.b64encode(
+                            uploaded_file.getvalue()
+                        ).decode("ascii"),
+                        "content_type": uploaded_file.type or "application/octet-stream",
+                    }
+                    response = requests.post(
+                        f"{BACKEND_URL}/aws/s3/upload/{session_id}",
+                        json=payload,
+                        timeout=120,
+                    )
+                    data = _backend_json_response(response, "Could not upload the S3 object.")
+                    if isinstance(data, dict) and data.get("success"):
+                        st.session_state[status_key] = (
+                            f"Uploaded '{upload_key.strip()}' to bucket '{bucket_name}'. "
+                            "Refresh View Files to verify it."
+                        )
+                        st.success("Upload completed successfully.")
+                        st.json(data)
+                    else:
+                        st.error("Upload did not return a success response.")
+                except requests.exceptions.RequestException as exc:
+                    st.error(f"Upload request failed: {exc}")
+        return
+
+    # Download mode: select an object and keep the returned bytes across reruns.
+    objects_response = requests.get(
+        f"{BACKEND_URL}/aws/s3/objects/{session_id}",
+        params={"bucket_name": bucket_name},
+        timeout=60,
+    )
+    objects_data = _backend_json_response(objects_response, "Could not load S3 objects.")
+    objects = objects_data.get("objects", []) if isinstance(objects_data, dict) else []
+    object_lookup = {}
+    for item in objects:
+        if isinstance(item, dict):
+            key = item.get("key") or item.get("Key") or item.get("object_key")
+            if key:
+                size = item.get("size", item.get("Size", 0))
+                object_lookup[f"{key} ({size} bytes)"] = key
+        elif isinstance(item, str):
+            object_lookup[item] = item
+
+    if not object_lookup:
+        st.info("No objects were returned for this bucket.")
+        return
+
+    # View Files must only list every object. It must not show
+    # selection, download, upload, or delete controls.
+    if mode == "view_files":
+        file_rows = []
+        for item in objects:
+            if isinstance(item, dict):
+                key = item.get("key") or item.get("Key") or item.get("object_key")
+                if not key:
+                    continue
+                file_rows.append({
+                    "File name": key,
+                    "Size (bytes)": item.get("size", item.get("Size", 0)),
+                    "Last modified": item.get(
+                        "last_modified",
+                        item.get("LastModified", ""),
+                    ),
+                    "Storage class": item.get(
+                        "storage_class",
+                        item.get("StorageClass", ""),
+                    ),
+                })
+            elif isinstance(item, str):
+                file_rows.append({
+                    "File name": item,
+                    "Size (bytes)": "",
+                    "Last modified": "",
+                    "Storage class": "",
+                })
+
+        st.dataframe(
+            file_rows,
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption(f"{len(file_rows)} file(s) found in AWS S3 bucket '{bucket_name}'.")
+        return
+
+    selected_label = st.selectbox(
+        "Select S3 object",
+        list(object_lookup.keys()),
+        key=f"s3_selected_object_{resource_key}",
+    )
+    selected_key = object_lookup[selected_label]
+
+    if mode in {"view_files", "download_file"}:
+        if st.button(
+            "⬇️ Download Selected Object",
+            key=f"s3_download_{resource_key}",
+            use_container_width=True,
+        ):
+            try:
+                response = requests.post(
+                    f"{BACKEND_URL}/aws/s3/download/{session_id}",
+                    json={"bucket_name": bucket_name, "object_key": selected_key},
+                    timeout=120,
+                )
+                data = _backend_json_response(response, "Could not download the S3 object.")
+                if isinstance(data, dict) and data.get("content_base64"):
+                    st.session_state[download_key] = {
+                        "file_name": selected_key.split("/")[-1],
+                        "content": base64.b64decode(data["content_base64"]),
+                    }
+                    st.success(f"Downloaded '{selected_key}' from AWS. Click Save File below.")
+                else:
+                    st.error("Download response did not contain file content.")
+            except requests.exceptions.RequestException as exc:
+                st.error(f"Download request failed: {exc}")
+
+    saved = st.session_state.get(download_key)
+    if saved:
+        st.download_button(
+            "💾 Save File",
+            data=saved["content"],
+            file_name=saved["file_name"],
+            key=f"s3_save_{resource_key}",
+            use_container_width=True,
+        )
+
+    if mode == "view_files":
+        st.caption("Files listed above are read directly from the selected AWS S3 bucket.")
+
+def render_cloudwatch_logs(session_id, service, details, resource_id):
+    """Load recent CloudWatch logs when the user selects View Logs."""
+    st.markdown("#### CloudWatch Logs")
+    default_group = (
+        details.get("log_group_name")
+        or details.get("logGroupName")
+        or details.get("cloudwatch_log_group")
+        or ""
+    )
+    log_group = st.text_input(
+        "Log group name",
+        value=default_group,
+        placeholder="/aws/lambda/function-name",
+        key=f"log_group_{service}_{resource_id}",
+    )
+    log_stream = st.text_input(
+        "Log stream name (optional)",
+        value="",
+        key=f"log_stream_{service}_{resource_id}",
+    )
+    limit = st.number_input(
+        "Number of events",
+        min_value=1,
+        max_value=200,
+        value=50,
+        step=1,
+        key=f"log_limit_{service}_{resource_id}",
+    )
+    if st.button(
+        "Load Logs",
+        key=f"load_logs_{service}_{resource_id}",
+        use_container_width=True,
+    ):
+        if not log_group.strip():
+            st.warning("Enter a CloudWatch log group name.")
+            return
+        try:
+            params = {
+                "log_group_name": log_group.strip(),
+                "limit": int(limit),
+            }
+            if log_stream.strip():
+                params["log_stream_name"] = log_stream.strip()
+            response = requests.get(
+                f"{BACKEND_URL}/aws/cloudwatch/logs/{session_id}",
+                params=params,
+                timeout=60,
+            )
+            data = _backend_json_response(response, "Could not load CloudWatch logs.")
+            if isinstance(data, dict):
+                events = data.get("events", [])
+                if events:
+                    for event in events:
+                        timestamp = event.get("timestamp", "")
+                        message = event.get("message", "").rstrip()
+                        st.code(f"{timestamp}  {message}")
+                else:
+                    st.info(data.get("message", "No log events found."))
+        except requests.exceptions.RequestException as exc:
+            st.error(f"Log request failed: {exc}")
+
+
+def render_security_group_rules(details):
+    """Display inbound and outbound security-group rules."""
+    st.markdown("#### Security Group Rules")
+    ingress = details.get("ip_permissions") or details.get("IpPermissions") or []
+    egress = details.get("ip_permissions_egress") or details.get("IpPermissionsEgress") or []
+
+    def normalize_rules(rules):
+        normalized = []
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            protocol = rule.get("ip_protocol", rule.get("IpProtocol", "-1"))
+            from_port = rule.get("from_port", rule.get("FromPort", "—"))
+            to_port = rule.get("to_port", rule.get("ToPort", "—"))
+            sources = []
+            for item in rule.get("ip_ranges", rule.get("IpRanges", [])) or []:
+                if isinstance(item, dict):
+                    sources.append(item.get("cidr_ip", item.get("CidrIp", "")))
+            for item in rule.get("ipv6_ranges", rule.get("Ipv6Ranges", [])) or []:
+                if isinstance(item, dict):
+                    sources.append(item.get("cidr_ipv6", item.get("CidrIpv6", "")))
+            for item in rule.get("user_id_group_pairs", rule.get("UserIdGroupPairs", [])) or []:
+                if isinstance(item, dict):
+                    sources.append(item.get("group_id", item.get("GroupId", "")))
+            normalized.append({
+                "Protocol": protocol,
+                "Ports": f"{from_port}-{to_port}" if from_port != "—" else "All",
+                "Sources": ", ".join(value for value in sources if value) or "Any",
+            })
+        return normalized
+
+    inbound = normalize_rules(ingress)
+    outbound = normalize_rules(egress)
+    st.write("Inbound rules")
+    st.dataframe(inbound, use_container_width=True, hide_index=True)
+    st.write("Outbound rules")
+    st.dataframe(outbound, use_container_width=True, hide_index=True)
+
+
+def render_live_resource_action(service, details, resource_id, resource_name, index):
+    """Render one unified, state-aware action toolbar for a resource card."""
+    actions = get_live_resource_actions(service, details)
+    labels = {
+        "view_details": "👁️ View Details",
+        "view_files": "📄 View Files",
+        "upload_file": "⬆️ Upload File",
+        "download_file": "⬇️ Download File",
+        "view_logs": "📊 View Logs",
+        "view_rules": "🛡️ View Rules",
+        "start": "▶️ Start",
+        "stop": "⏹️ Stop",
+        "reboot": "↻ Reboot",
+        "enable": "✅ Enable",
+        "disable": "⏸️ Disable",
+        "delete": "🗑️ Delete Resource",
+    }
+
+    detail_key = f"show_resource_details_{service}_{index}_{resource_id}"
+    details_open = st.session_state.get(detail_key, False)
+    active_action_key = f"active_resource_action_{service}_{index}_{resource_id}"
+    active_action = st.session_state.get(active_action_key)
+    labels["view_details"] = "🙈 Hide Details" if details_open else "👁️ View Details"
+
+    st.markdown('<div class="resource-action-heading">⚡ Actions</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="resource-action-caption">Manage this resource using the available state-aware operations.</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Keep destructive actions visually separated and make the toolbar responsive.
+    primary_actions = [item for item in actions if item != "delete"]
+    action_cols = st.columns(min(max(len(primary_actions), 1), 4))
+    for position, selected in enumerate(primary_actions):
+        with action_cols[position % len(action_cols)]:
+            if st.button(
+                labels.get(selected, selected.replace("_", " ").title()),
+                key=f"live_action_{selected}_{service}_{index}_{resource_id}",
+                use_container_width=True,
+                type="secondary",
+            ):
+                if selected == "view_details":
+                    st.session_state[detail_key] = not st.session_state.get(detail_key, False)
+                    st.rerun()
+
+                if selected in {"view_files", "upload_file", "download_file", "view_logs", "view_rules"}:
+                    st.session_state[active_action_key] = selected
+                    st.rerun()
+
+                try:
+                    resource_type, parameters = build_live_resource_action(
+                        service, details, resource_id, resource_name, selected
+                    )
+                    post_action_plan(
+                        selected,
+                        resource_type,
+                        parameters,
+                        f"User requested {selected} for {resource_name}.",
+                    )
+                except ValueError as exc:
+                    st.error(str(exc))
+
+    # Render non-destructive tools after reruns, using the persisted action.
+    if active_action == "view_rules":
+        render_security_group_rules(details)
+
+    if active_action in {"view_files", "upload_file", "download_file"}:
+        if service != "s3":
+            st.warning("This action is only available for S3 buckets.")
+        else:
+            bucket_name = details.get("bucket_name") or details.get("name") or resource_id
+            render_s3_object_tools(
+                st.session_state.session_id,
+                bucket_name,
+                f"{service}_{index}_{resource_id}",
+                mode=active_action,
+            )
+
+    if active_action == "view_logs":
+        render_cloudwatch_logs(
+            st.session_state.session_id,
+            service,
+            details,
+            resource_id,
+        )
+
+    if active_action and st.button(
+        "✖ Close tools",
+        key=f"close_tools_{service}_{index}_{resource_id}",
+    ):
+        st.session_state.pop(active_action_key, None)
+        st.rerun()
+
+    if "delete" in actions:
+        st.markdown("<div style='height:0.35rem'></div>", unsafe_allow_html=True)
+        delete_col, _ = st.columns([1, 3])
+        with delete_col:
+            delete_clicked = st.button(
+                labels["delete"],
+                key=f"live_action_delete_{service}_{index}_{resource_id}",
+                use_container_width=True,
+                type="primary",
+            )
+        if delete_clicked:
+            warning_key = f"delete_warning_{service}_{index}_{resource_id}"
+            st.session_state[warning_key] = True
+            try:
+                resource_type, parameters = build_live_resource_action(
+                    service, details, resource_id, resource_name, "delete"
+                )
+                post_action_plan(
+                    "delete",
+                    resource_type,
+                    parameters,
+                    f"User requested delete for {resource_name}.",
+                )
+            except ValueError as exc:
+                st.error(str(exc))
+
+    warning_key = f"delete_warning_{service}_{index}_{resource_id}"
+    if st.session_state.get(warning_key):
+        st.warning(
+            "Deletion is irreversible. Review the pending action and confirm the exact resource identifier before execution."
+        )
+
+
 def display_resource_manager():
-    """Display live AWS resources as human-readable resource cards."""
-    st.header("☁️ Live AWS Resources")
-    st.caption(
-        "View live AWS resources in a readable format. "
-        "Technical information is displayed as fields and sections, not raw JSON."
+    """Display live AWS resources in a single, polished resource workspace."""
+    st.markdown(
+        """
+        <div class="resource-page-header">
+            <div>
+                <div class="eyebrow">AWS CONSOLE</div>
+                <h1>Live Resources</h1>
+                <p>Inspect your AWS infrastructure and manage resources from one unified workspace.</p>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
     service = st.selectbox(
         "AWS service",
-        [
-            "ec2",
-            "s3",
-            "rds",
-            "lambda",
-            "vpc",
-            "subnet",
-            "security_group",
-        ],
-        format_func=lambda value: (
-            f"{get_service_icon(value)} {get_service_title(value)}"
-        ),
+        ["ec2", "s3", "rds", "lambda", "vpc", "subnet", "security_group"],
+        format_func=lambda value: f"{get_service_icon(value)} {get_service_title(value)}",
         key="live_resource_service",
     )
 
-    # A successful Create/Delete action does not display its confirmation
-    # here. Instead, when the user opens Live Resources, refresh only the
-    # affected service so the newly created/deleted resource is reflected.
-    refresh_needed = st.session_state.get(
-        "live_resources_refresh_needed", False
-    )
-    refresh_service = st.session_state.get(
-        "live_resources_refresh_service"
-    )
+    controls_left, controls_right = st.columns([5, 1])
+    with controls_left:
+        st.caption("Choose a service, load its live resources, then use the actions inside each resource card.")
+    with controls_right:
+        load_clicked = st.button("Refresh", use_container_width=True, type="primary")
 
-    if refresh_needed and refresh_service == service:
+    refresh_needed = st.session_state.get("live_resources_refresh_needed", False)
+    refresh_service = st.session_state.get("live_resources_refresh_service")
+    should_load = load_clicked or (refresh_needed and refresh_service == service)
+
+    if should_load:
         try:
-            with st.spinner(
-                f"Refreshing {get_service_title(service)}..."
-            ):
+            with st.spinner(f"Loading {get_service_title(service)}..."):
                 response = requests.get(
-                    f"{BACKEND_URL}/aws/resources/"
-                    f"{st.session_state.session_id}",
-                    params={"service": service},
-                    timeout=60,
-                )
-
-            if response.status_code == 200:
-                data = response.json()
-                resources = (
-                    data.get("resources", [])
-                    if isinstance(data, dict)
-                    else []
-                )
-                st.session_state.live_resources = resources
-                st.session_state.live_resources_service = service
-                st.session_state.live_resources_refresh_needed = False
-                st.session_state.live_resources_refresh_service = None
-            else:
-                show_error(
-                    response,
-                    "Could not refresh AWS resources after the action.",
-                )
-        except requests.exceptions.RequestException as exc:
-            st.error(f"Resource refresh failed: {exc}")
-
-    if st.button(
-        "🔄 Load Live Resources",
-        use_container_width=True,
-        type="primary",
-    ):
-        try:
-            with st.spinner(
-                f"Loading {get_service_title(service)}..."
-            ):
-                response = requests.get(
-                    f"{BACKEND_URL}/aws/resources/"
-                    f"{st.session_state.session_id}",
+                    f"{BACKEND_URL}/aws/resources/{st.session_state.session_id}",
                     params={"service": service},
                     timeout=60,
                 )
 
             if response.status_code != 200:
-                show_error(
-                    response,
-                    "Could not load AWS resources.",
-                )
+                show_error(response, "Could not load AWS resources.")
                 return
 
             data = response.json()
             resources = data.get("resources", []) if isinstance(data, dict) else []
-
             st.session_state.live_resources = resources
             st.session_state.live_resources_service = service
-
-            st.success(
-                f"Loaded {len(resources)} {get_service_title(service).lower()}."
-            )
-
+            st.session_state.live_resources_refresh_needed = False
+            st.session_state.live_resources_refresh_service = None
         except requests.exceptions.RequestException as exc:
             st.error(f"Resource loading failed: {exc}")
             return
 
     resources = st.session_state.get("live_resources", [])
-    loaded_service = st.session_state.get("live_resources_service")
-
-    if loaded_service != service:
+    if st.session_state.get("live_resources_service") != service:
         resources = []
 
     if not resources:
-        st.info(
-            "Select an AWS service and click 'Load Live Resources' "
-            "to view the resources."
-        )
+        st.info("No resources loaded yet. Select a service and click Refresh.")
         return
 
-    st.divider()
+    total = len(resources)
+    active = 0
+    private_or_default = 0
+    for resource in resources:
+        details = resource.get("details") or {}
+        state = str(details.get("state") or details.get("status") or "").lower()
+        if state in {"running", "available", "active", "enabled", "in-use"}:
+            active += 1
+        if details.get("public_ip") in (None, ""):
+            private_or_default += 1
 
-    title_col, count_col = st.columns([5, 1])
-    with title_col:
-        st.markdown(
-            f"## {get_service_icon(service)} {get_service_title(service)}"
-        )
-    with count_col:
-        st.metric("Resources", len(resources))
+    metric_cols = st.columns(4)
+    metric_values = [
+        ("Total Resources", total),
+        ("Active / Available", active),
+        ("Private / Unassigned", private_or_default),
+        ("Service", service.upper()),
+    ]
+    for metric_col, (label, value) in zip(metric_cols, metric_values):
+        with metric_col:
+            st.markdown(
+                f"<div class='metric-label'>{label}</div><div class='metric-value'>{value}</div>",
+                unsafe_allow_html=True,
+            )
+
+    st.markdown(
+        f"<div class='resource-section-title'><span>{get_service_icon(service)} {get_service_title(service)}</span><span class='resource-count'>{total} resources</span></div>",
+        unsafe_allow_html=True,
+    )
 
     for index, resource in enumerate(resources):
         details = resource.get("details") or {}
-        resource_id = resource.get("id") or "Unknown"
-        resource_name = resource.get("name") or resource_id
-
         if not isinstance(details, dict):
             details = {"details": details}
 
+        resource_id = resource.get("id") or "Unknown"
+        resource_name = resource.get("name") or resource_id
         if service == "ec2":
-            title = f"🖥️ {resource_name}"
             status = details.get("state", "unknown")
-        elif service == "s3":
-            title = f"🪣 {resource_name}"
-            status = None
         elif service == "rds":
-            title = f"🗄️ {resource_name}"
             status = details.get("status", "unknown")
-        elif service == "lambda":
-            title = f"λ {resource_name}"
-            status = None
         elif service == "vpc":
-            title = f"🌐 {resource_name}"
             status = details.get("state", "available")
-        elif service == "subnet":
-            title = f"🔗 {resource_name}"
-            status = None
         else:
-            title = f"🔐 {resource_name}"
-            status = None
+            status = details.get("status") or details.get("state")
 
         with st.container(border=True):
-            header_col, status_col = st.columns([5, 1])
-
-            with header_col:
-                st.markdown(f"### {title}")
-                st.markdown(
-                    f'<div class="resource-id">{resource_id}</div>',
-                    unsafe_allow_html=True,
-                )
-
-            if status is not None:
-                with status_col:
-                    status_class = get_status_class(status)
+            head_left, head_right = st.columns([5, 1])
+            with head_left:
+                st.markdown(f"<div class='resource-card-title'>{get_service_icon(service)} {resource_name}</div>", unsafe_allow_html=True)
+                st.markdown(f"<div class='resource-id'>{resource_id}</div>", unsafe_allow_html=True)
+            with head_right:
+                if status:
                     st.markdown(
-                        f'<div class="{status_class}">{str(status).title()}</div>',
+                        f"<div class='{get_status_class(status)}'>{str(status).title()}</div>",
                         unsafe_allow_html=True,
                     )
 
-            st.divider()
-
+            st.markdown("<div class='resource-divider'></div>", unsafe_allow_html=True)
             summary = resource_summary_fields(service, details)
             if summary:
                 display_detail_grid(summary, columns=4)
-            else:
-                st.caption("Resource information available in Technical Details.")
 
-            st.divider()
-
-            details_key = f"show_resource_details_{service}_{index}_{resource_id}"
-
-            if st.button(
-                "🔍 View Technical Details"
-                if not st.session_state.get(details_key, False)
-                else "🔼 Hide Technical Details",
-                key=f"resource_details_button_{service}_{index}_{resource_id}",
-                use_container_width=True,
-            ):
-                st.session_state[details_key] = not st.session_state.get(
-                    details_key,
-                    False,
-                )
-                st.rerun()
-
-            if st.session_state.get(details_key, False):
-                st.divider()
+            detail_key = f"show_resource_details_{service}_{index}_{resource_id}"
+            if st.session_state.get(detail_key, False):
                 with st.container(border=True):
-                    display_resource_technical_details(
-                        service,
-                        details,
-                    )
+                    st.markdown("#### Technical Details")
+                    display_resource_technical_details(service, details)
 
-            # RCA is deliberately not shown here.
-            # RCA remains available through the main AI Agent chat.
-
+            st.markdown("<div class='resource-divider'></div>", unsafe_allow_html=True)
+            st.markdown("#### Actions")
+            render_live_resource_action(service, details, resource_id, resource_name, index)
 
 
 # =====================================================
@@ -1857,12 +2312,16 @@ with st.sidebar:
 
     if st.session_state.aws_connected:
         st.subheader("🛠️ Resource Management")
-        st.caption("Create or delete AWS resources from the main panel.")
-        st.session_state.resource_page = st.radio(
+        st.caption("Create AWS resources from the main panel. Delete actions are available inside Live Resources.")
+        selected_resource_page = st.radio(
             "Open",
-            ["Chat", "Create / Delete Resource", "Live Resources"],
+            ["Chat", "Create Resource", "Live Resources"],
             key="resource_page_selector",
         )
+        if st.session_state.get("pending_action_id"):
+            st.session_state.resource_page = "Create Resource"
+        else:
+            st.session_state.resource_page = selected_resource_page
         st.divider()
         st.success("🟢 AWS Connected")
         st.write(
@@ -1891,7 +2350,7 @@ if not st.session_state.aws_connected:
 
 resource_page = st.session_state.get("resource_page", "Chat")
 
-if resource_page == "Create / Delete Resource":
+if resource_page == "Create Resource":
     display_single_action_manager()
 elif resource_page == "Live Resources":
     display_resource_manager()
