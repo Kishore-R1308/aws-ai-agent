@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+chroma_db/
+.vscode/
+*.log
+# Local SQLite database
+*.db
+aws_agent.db
