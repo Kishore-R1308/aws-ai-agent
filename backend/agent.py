@@ -5,7 +5,7 @@ from typing import TypedDict
 from langchain_openai import ChatOpenAI
 from langgraph.graph import START, END, StateGraph
 
-from aws_tools import (
+from backend.aws_tools import (
     get_ec2_instances,
     get_rds_instances,
     get_s3_buckets,
@@ -30,7 +30,7 @@ from aws_tools import (
     get_cloudwatch_logs
 )
 
-from rag import retrieve_context
+from backend.rag import retrieve_context
 
 
 # =====================================================

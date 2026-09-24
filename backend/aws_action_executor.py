@@ -18,10 +18,12 @@ before this executor is called.
 
 from typing import Any, Dict, List, Optional
 import base64
+import io
 import json
 import re
+import zipfile
 
-from aws_auth import get_aws_client
+from backend.aws_auth import get_aws_client
 
 
 SUPPORTED_ACTIONS = {
@@ -42,7 +44,6 @@ SUPPORTED_ACTIONS = {
     "disable": {"lambda_function"},
     "delete": {
         "s3_bucket",
-        "s3_object",
         "ec2_instance",
         "rds_instance",
         "lambda_function",
@@ -84,7 +85,6 @@ def execute_aws_action(
 
     executors = {
         "s3_bucket": execute_s3,
-        "s3_object": execute_s3_object,
         "ec2_instance": execute_ec2,
         "rds_instance": execute_rds,
         "lambda_function": execute_lambda,
@@ -204,7 +204,17 @@ def execute_s3(
 
     if action == "create":
 
-        region = get_region(parameters)
+        # Prefer an explicitly supplied region, but otherwise use the
+        # region configured on the AWS client/session. This is important
+        # for regional S3 endpoints such as ap-south-2.
+        region = parameters.get("region")
+        if not isinstance(region, str) or not region.strip():
+            region = getattr(client.meta, "region_name", None)
+
+        if not isinstance(region, str) or not region.strip():
+            region = "us-east-1"
+
+        region = region.strip()
 
         if region == "us-east-1":
             response = client.create_bucket(
@@ -253,64 +263,6 @@ def execute_s3(
 
 
 # =====================================================
-# 1B. S3 OBJECT
-# =====================================================
-
-
-def execute_s3_object(
-    session_id: str,
-    action: str,
-    parameters: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Delete one object from an S3 bucket."""
-
-    if action != "delete":
-        raise ValueError(
-            f"Unsupported S3 object action: {action}"
-        )
-
-    client = get_aws_client(
-        session_id=session_id,
-        service_name="s3",
-    )
-
-    bucket_name = validate_identifier(
-        require_string(parameters, "bucket_name"),
-        "bucket_name",
-    )
-
-    object_key = require_string(
-        parameters,
-        "object_key",
-    )
-
-    if len(object_key) > 1024:
-        raise ValueError("object_key is too long")
-
-    confirmation_identifier = f"{bucket_name}/{object_key}"
-
-    require_delete_confirmation(
-        parameters,
-        confirmation_identifier,
-    )
-
-    client.delete_object(
-        Bucket=bucket_name,
-        Key=object_key,
-    )
-
-    return {
-        "success": True,
-        "service": "s3",
-        "resource_type": "s3_object",
-        "action": "delete",
-        "bucket_name": bucket_name,
-        "object_key": object_key,
-        "message": "S3 object deletion request completed successfully",
-    }
-
-
-# =====================================================
 # 2. EC2
 # =====================================================
 
@@ -343,12 +295,28 @@ def execute_ec2(
             "key_name",
         )
 
+        resource_name = require_string(
+            parameters,
+            "resource_name",
+        )
+
         request = {
             "ImageId": ami_id,
             "InstanceType": instance_type,
             "KeyName": key_name,
             "MinCount": 1,
             "MaxCount": 1,
+            "TagSpecifications": [
+                {
+                    "ResourceType": "instance",
+                    "Tags": [
+                        {
+                            "Key": "Name",
+                            "Value": resource_name,
+                        }
+                    ],
+                }
+            ],
         }
 
         subnet_id = parameters.get("subnet_id")
@@ -666,19 +634,47 @@ def execute_lambda(
 
         zip_file = parameters.get("zip_file")
 
-        if not isinstance(zip_file, str):
+        if not isinstance(zip_file, str) or not zip_file.strip():
             raise ValueError(
-                "zip_file must be a base64-encoded string"
+                "zip_file must contain the base64-encoded Lambda ZIP package"
             )
+
+        # The frontend sends the uploaded ZIP as base64. Also accept a
+        # data-URI prefix so the executor remains compatible with clients
+        # that send browser-style base64 values.
+        encoded_zip = zip_file.strip()
+        if encoded_zip.startswith("data:") and "," in encoded_zip:
+            encoded_zip = encoded_zip.split(",", 1)[1]
+
+        # Remove accidental line breaks/whitespace introduced by another
+        # client while keeping the actual base64 payload unchanged.
+        encoded_zip = "".join(encoded_zip.split())
 
         try:
             code_bytes = base64.b64decode(
-                zip_file,
+                encoded_zip,
                 validate=True,
             )
         except Exception as exc:
             raise ValueError(
-                "zip_file is not valid base64"
+                "zip_file is not valid base64. Upload a valid .zip Lambda package."
+            ) from exc
+
+        if not code_bytes:
+            raise ValueError(
+                "The Lambda ZIP package is empty."
+            )
+
+        # A Lambda deployment package must actually be a ZIP archive.
+        try:
+            with zipfile.ZipFile(io.BytesIO(code_bytes)) as zip_package:
+                if zip_package.testzip() is not None:
+                    raise ValueError(
+                        "The Lambda ZIP package is corrupted."
+                    )
+        except zipfile.BadZipFile as exc:
+            raise ValueError(
+                "The uploaded Lambda package is not a valid ZIP file."
             ) from exc
 
         response = client.create_function(
@@ -856,8 +852,24 @@ def execute_vpc(
             "cidr_block",
         )
 
+        resource_name = require_string(
+            parameters,
+            "resource_name",
+        )
+
         response = client.create_vpc(
             CidrBlock=cidr_block,
+            TagSpecifications=[
+                {
+                    "ResourceType": "vpc",
+                    "Tags": [
+                        {
+                            "Key": "Name",
+                            "Value": resource_name,
+                        }
+                    ],
+                }
+            ],
         )
 
         vpc = response.get(
@@ -871,6 +883,7 @@ def execute_vpc(
             "action": "create",
             "vpc_id": vpc.get("VpcId"),
             "cidr_block": cidr_block,
+            "resource_name": resource_name,
         }
 
     if action == "delete":
@@ -934,10 +947,26 @@ def execute_subnet(
             "availability_zone",
         )
 
+        resource_name = require_string(
+            parameters,
+            "resource_name",
+        )
+
         response = client.create_subnet(
             VpcId=vpc_id,
             CidrBlock=cidr_block,
             AvailabilityZone=availability_zone,
+            TagSpecifications=[
+                {
+                    "ResourceType": "subnet",
+                    "Tags": [
+                        {
+                            "Key": "Name",
+                            "Value": resource_name,
+                        }
+                    ],
+                }
+            ],
         )
 
         subnet = response.get(
@@ -953,6 +982,7 @@ def execute_subnet(
                 "SubnetId"
             ),
             "vpc_id": vpc_id,
+            "resource_name": resource_name,
         }
 
     if action == "delete":

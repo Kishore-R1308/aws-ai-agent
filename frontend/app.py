@@ -1,6 +1,7 @@
 
 import os
 import json
+import base64
 import uuid
 import requests
 import streamlit as st
@@ -172,6 +173,9 @@ DEFAULT_STATE = {
     "live_resources_service": None,
     "live_resources_refresh_needed": False,
     "live_resources_refresh_service": None,
+    "last_action_result": None,
+    "next_resource_page": None,
+    "action_result_return_page": "Create Resource",
 }
 
 for key, value in DEFAULT_STATE.items():
@@ -252,6 +256,85 @@ def mark_live_resources_for_refresh(resource_type):
 
     st.session_state.live_resources_refresh_needed = bool(service)
     st.session_state.live_resources_refresh_service = service
+
+
+def store_action_result(response_data, payload):
+    """Store a compact human-readable result for display after rerun."""
+    action = str(payload.get("action", "action")).lower()
+    resource_type = str(payload.get("resource_type", "resource"))
+    parameters = payload.get("parameters") or {}
+
+    identifier = (
+        parameters.get("function_name")
+        or parameters.get("bucket_name")
+        or parameters.get("instance_id")
+        or parameters.get("db_instance_identifier")
+        or parameters.get("group_id")
+        or parameters.get("vpc_id")
+        or parameters.get("subnet_id")
+        or parameters.get("resource_name")
+        or response_data.get("function_name")
+        or response_data.get("bucket_name")
+        or response_data.get("instance_id")
+        or response_data.get("db_instance_identifier")
+        or response_data.get("group_id")
+        or response_data.get("vpc_id")
+        or response_data.get("subnet_id")
+    )
+
+    backend_message = response_data.get("message") if isinstance(response_data, dict) else None
+    if backend_message:
+        message = str(backend_message)
+    elif identifier:
+        message = f"AWS {action} action completed successfully for {resource_type.replace('_', ' ')} '{identifier}'."
+    else:
+        message = f"AWS {action} action completed successfully."
+
+    st.session_state.last_action_result = {
+        "message": message,
+        "action": action,
+        "resource_type": resource_type,
+        "identifier": identifier,
+    }
+
+
+def display_action_result_page():
+    """Display the latest AWS action result on a dedicated page."""
+    result = st.session_state.get("last_action_result")
+
+    st.markdown(
+        """
+        <div class="resource-page-header">
+            <div class="eyebrow">AWS OPERATION COMPLETE</div>
+            <h1>✅ Action Completed</h1>
+            <p>The AWS operation has finished successfully.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if not result:
+        st.info("There is no recent AWS action to display.")
+        return
+
+    st.success(
+        f"✅ {result.get('message', 'AWS action completed successfully.')}"
+    )
+
+    return_page = st.session_state.get(
+        "action_result_return_page",
+        "Create Resource",
+    )
+
+    if st.button(
+        "← Back to previous page",
+        use_container_width=True,
+        key="action_result_back",
+    ):
+        st.session_state.last_action_result = None
+        st.session_state.resource_page = return_page
+        st.rerun()
+
 
 
 # =====================================================
@@ -671,6 +754,13 @@ def post_action_plan(action_type, resource_type, parameters, explanation):
 
         st.session_state.pending_action_id = action_id
         st.session_state.pending_action_payload = payload
+
+        # Remember the page from which the action was started so the
+        # dedicated result page can return the user to that exact page.
+        current_page = st.session_state.get("resource_page", "Create Resource")
+        if current_page in {"Create Resource", "Live Resources"}:
+            st.session_state.action_result_return_page = current_page
+
         # Reuse the existing secure confirmation screen for actions initiated
         # from Live Resources as well as the Create / Delete page.
         st.session_state.resource_page = "Create Resource"
@@ -714,6 +804,7 @@ def render_resource_fields(action_type, resource_type):
 
     elif resource_type == "ec2_instance":
         if action_type == "create":
+            text_field("Resource name", "resource_name", placeholder="MyEC2Server")
             text_field("AMI / Image ID", "ami_id", placeholder="ami-xxxxxxxx")
             text_field("Instance type", "instance_type", placeholder="t3.micro")
             number_field("Minimum count", "min_count", 1)
@@ -764,11 +855,21 @@ def render_resource_fields(action_type, resource_type):
             text_field("Runtime", "runtime", placeholder="python3.12")
             text_field("Execution role ARN", "role_arn")
             text_field("Handler", "handler", placeholder="lambda_function.lambda_handler")
-            text_field(
-                "ZIP file path / reference",
-                "zip_file",
-                placeholder="Path or backend-supported ZIP reference",
+
+            uploaded_zip = st.file_uploader(
+                "Lambda deployment ZIP file",
+                type=["zip"],
+                key="resource_lambda_zip_file",
+                help="Upload the .zip package containing your Lambda code. The frontend converts it to base64 before sending it to the backend.",
             )
+
+            if uploaded_zip is not None:
+                parameters["zip_file"] = base64.b64encode(
+                    uploaded_zip.getvalue()
+                ).decode("ascii")
+                st.caption(
+                    f"Selected: {uploaded_zip.name} ({uploaded_zip.size:,} bytes)"
+                )
         else:
             text_field("Function name", "function_name")
             text_field("Delete confirmation", "delete_confirmation")
@@ -784,6 +885,7 @@ def render_resource_fields(action_type, resource_type):
 
     elif resource_type == "vpc":
         if action_type == "create":
+            text_field("VPC name", "resource_name", placeholder="MyProductionVPC")
             text_field("CIDR block", "cidr_block", placeholder="10.0.0.0/16")
         else:
             text_field("VPC ID", "vpc_id")
@@ -791,6 +893,7 @@ def render_resource_fields(action_type, resource_type):
 
     elif resource_type == "subnet":
         if action_type == "create":
+            text_field("Subnet name", "resource_name", placeholder="MyPublicSubnet")
             text_field("VPC ID", "vpc_id")
             text_field("CIDR block", "cidr_block", placeholder="10.0.1.0/24")
             text_field("Availability zone", "availability_zone")
@@ -819,6 +922,25 @@ def render_resource_fields(action_type, resource_type):
             text_field("Delete confirmation", "delete_confirmation")
 
     return parameters
+
+
+def get_action_reason(action: str, resource_label: str, resource_name: str = "") -> str:
+    """Return a resource-specific default reason for auditability."""
+    reasons = {
+        "S3 Bucket": {"create": "Create an S3 bucket for storing application files and objects."},
+        "EC2 Instance": {"create": "Create an EC2 instance to host an application workload."},
+        "RDS Instance": {"create": "Create an RDS database for application data storage."},
+        "Lambda Function": {"create": "Create a Lambda function for serverless application processing."},
+        "Security Group": {"create": "Create a security group to control network traffic."},
+        "VPC": {"create": "Create a VPC to provide an isolated AWS network environment."},
+        "Subnet": {"create": "Create a subnet within the selected VPC for resource deployment."},
+        "IAM Resource": {"create": "Create an IAM resource to manage AWS permissions and access."},
+    }
+    reason = reasons.get(resource_label, {}).get(action.lower(), f"{action.title()} the selected {resource_label}.")
+    if resource_name:
+        reason = f"{reason.rstrip('.')} Target resource: {resource_name}."
+    return reason
+
 
 
 def display_single_action_manager():
@@ -874,10 +996,16 @@ def display_single_action_manager():
             st.markdown("### Resource configuration")
             with st.form("dynamic_resource_action_form", clear_on_submit=False):
                 parameters = render_resource_fields(action_type, resource_type)
+                resource_name_for_reason = parameters.get("resource_name", "")
+                default_reason = get_action_reason(
+                    action_type,
+                    resource_label,
+                    resource_name_for_reason,
+                )
                 explanation = st.text_area(
                     "Reason for this action",
-                    value=f"User requested {action_type} for {resource_label}.",
-                    key="resource_explanation",
+                    value=default_reason,
+                    key=f"resource_explanation_{resource_type}",
                     help="Explain why this operation is required for auditability.",
                 )
 
@@ -948,6 +1076,7 @@ def display_single_action_manager():
                     "access_key",
                     "password",
                     "token",
+                    "zip_file",
                 }
                 for key, value in parameters.items():
                     label = key.replace("_", " ").title()
@@ -1006,12 +1135,23 @@ def display_single_action_manager():
                             )
 
                         if response.status_code == 200:
-                            st.success("AWS action execution completed.")
-                            st.json(response.json())
+                            try:
+                                response_data = response.json()
+                            except ValueError:
+                                response_data = {}
+
+                            store_action_result(
+                                response_data,
+                                payload,
+                            )
                             mark_live_resources_for_refresh(resource_type)
                             reset_pending_action()
-                            st.session_state.resource_page = "Live Resources"
-                            st.session_state["resource_page_selector"] = "Live Resources"
+
+                            # Show the result on a dedicated page. Do not
+                            # modify the radio widget itself; the result page
+                            # is controlled through the separate resource_page
+                            # session-state value.
+                            st.session_state.resource_page = "Action Result"
                             st.rerun()
                         else:
                             show_error(response, "AWS action execution failed.")
@@ -1034,6 +1174,7 @@ def get_service_icon(service):
         "vpc": "🌐",
         "subnet": "🔗",
         "security_group": "🔐",
+        "iam": "👤",
     }.get(service, "☁️")
 
 
@@ -1047,6 +1188,7 @@ def get_service_title(service):
         "vpc": "VPCs",
         "subnet": "Subnets",
         "security_group": "Security Groups",
+        "iam": "IAM Resources",
     }.get(service, service.upper())
 
 
@@ -1398,6 +1540,8 @@ def display_resource_technical_details(service, details):
         display_subnet_details(details)
     elif service == "security_group":
         display_security_group_details(details)
+    elif service == "iam":
+        display_generic_details(details)
     else:
         display_generic_details(details)
 
@@ -1495,6 +1639,8 @@ def get_live_resource_actions(service, details=None):
         return ["view_details", "delete"]
     if service == "security_group":
         return ["view_details", "view_rules", "delete"]
+    if service == "iam":
+        return ["view_details", "delete"]
     return ["view_details"]
 
 
@@ -1544,6 +1690,22 @@ def build_live_resource_action(service, details, resource_id, resource_name, act
         }
         resource_type = "security_group"
 
+    elif service == "iam":
+        # IAM live-resource responses should provide the resource kind.
+        # Fall back to a common role shape when available.
+        resource_kind = (
+            details.get("resource_kind")
+            or details.get("kind")
+            or details.get("iam_resource_type")
+            or details.get("type")
+            or "role"
+        )
+        parameters = {
+            "resource_kind": str(resource_kind).strip().lower(),
+            "resource_name": details.get("resource_name") or details.get("name") or resource_id,
+        }
+        resource_type = "iam_resource"
+
     else:
         raise ValueError(f"No live-resource action mapping for {service}")
 
@@ -1558,6 +1720,7 @@ def build_live_resource_action(service, details, resource_id, resource_name, act
             or parameters.get("group_id")
             or parameters.get("vpc_id")
             or parameters.get("subnet_id")
+            or parameters.get("resource_name")
         )
         parameters["delete_confirmation"] = identifier
 
@@ -1988,7 +2151,7 @@ def display_resource_manager():
 
     service = st.selectbox(
         "AWS service",
-        ["ec2", "s3", "rds", "lambda", "vpc", "subnet", "security_group"],
+        ["ec2", "s3", "rds", "lambda", "vpc", "subnet", "security_group", "iam"],
         format_func=lambda value: f"{get_service_icon(value)} {get_service_title(value)}",
         key="live_resource_service",
     )
@@ -2081,22 +2244,14 @@ def display_resource_manager():
             status = details.get("status") or details.get("state")
 
         with st.container(border=True):
-            head_left, head_right = st.columns([5, 1])
-            with head_left:
-                st.markdown(f"<div class='resource-card-title'>{get_service_icon(service)} {resource_name}</div>", unsafe_allow_html=True)
-                st.markdown(f"<div class='resource-id'>{resource_id}</div>", unsafe_allow_html=True)
-            with head_right:
-                if status:
-                    st.markdown(
-                        f"<div class='{get_status_class(status)}'>{str(status).title()}</div>",
-                        unsafe_allow_html=True,
-                    )
+            # Keep only the resource name at the top of the card.
+            # All other resource information is already available in View Details.
+            st.markdown(
+                f"<div class='resource-card-title'>{get_service_icon(service)} {resource_name}</div>",
+                unsafe_allow_html=True,
+            )
 
             st.markdown("<div class='resource-divider'></div>", unsafe_allow_html=True)
-            summary = resource_summary_fields(service, details)
-            if summary:
-                display_detail_grid(summary, columns=4)
-
             detail_key = f"show_resource_details_{service}_{index}_{resource_id}"
             if st.session_state.get(detail_key, False):
                 with st.container(border=True):
@@ -2313,6 +2468,7 @@ with st.sidebar:
     if st.session_state.aws_connected:
         st.subheader("🛠️ Resource Management")
         st.caption("Create AWS resources from the main panel. Delete actions are available inside Live Resources.")
+
         selected_resource_page = st.radio(
             "Open",
             ["Chat", "Create Resource", "Live Resources"],
@@ -2320,6 +2476,8 @@ with st.sidebar:
         )
         if st.session_state.get("pending_action_id"):
             st.session_state.resource_page = "Create Resource"
+        elif st.session_state.get("last_action_result"):
+            st.session_state.resource_page = "Action Result"
         else:
             st.session_state.resource_page = selected_resource_page
         st.divider()
@@ -2354,6 +2512,8 @@ if resource_page == "Create Resource":
     display_single_action_manager()
 elif resource_page == "Live Resources":
     display_resource_manager()
+elif resource_page == "Action Result":
+    display_action_result_page()
 
 
 # =====================================================

@@ -13,7 +13,7 @@ from qdrant_client import QdrantClient
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from config import CHROMA_PATH
+from backend.config import CHROMA_PATH
 
 
 # ============================================================

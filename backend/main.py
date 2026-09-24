@@ -6,25 +6,25 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 
-from agent import run_agent
-from aws_auth import AWS_SESSIONS, connect_aws
-from database import Base, engine, get_db
-from models import ChatMessage
-from schemas import (
+from backend.agent import run_agent
+from backend.aws_auth import AWS_SESSIONS, connect_aws
+from backend.database import Base, engine, get_db
+from backend.models import ChatMessage
+from backend.schemas import (
     AWSConnectRequest,
     AWSConnectResponse,
     ChatRequest,
     ChatResponse,
 )
 
-from action_schemas import (
+from backend.action_schemas import (
     AWSActionRequest,
     AWSActionApprovalRequest,
     RCARecommendedActionBatch,
     RCABatchApprovalRequest,
 )
 
-from action_store import (
+from backend.action_store import (
     create_pending_action,
     get_pending_action,
     approve_pending_action,
@@ -36,9 +36,9 @@ from action_store import (
     update_batch_action_status,
 )
 
-from action_validation import validate_action
-from aws_action_executor import execute_aws_action
-from aws_tools import (
+from backend.action_validation import validate_action
+from backend.aws_action_executor import execute_aws_action
+from backend.aws_tools import (
     get_ec2_instances,
     get_s3_buckets,
     get_rds_instances,
@@ -46,6 +46,7 @@ from aws_tools import (
     get_vpcs,
     get_subnets,
     get_security_groups,
+    get_iam_resources,
 )
 
 
@@ -58,7 +59,10 @@ Base.metadata.create_all(bind=engine)
 
 def migrate_chat_messages():
     """
-    Add conversation_id to existing databases if it does not exist.
+    Safely migrate existing chat_messages databases.
+
+    Adds columns required by the current ChatMessage model when they are
+    missing from an older SQLite database. Existing rows are preserved.
     """
 
     inspector = inspect(engine)
@@ -71,20 +75,71 @@ def migrate_chat_messages():
         for column in inspector.get_columns("chat_messages")
     }
 
-    if "conversation_id" not in columns:
-        with engine.begin() as connection:
-            connection.execute(
-                text(
-                    "ALTER TABLE chat_messages "
-                    "ADD COLUMN conversation_id VARCHAR(100)"
-                )
-            )
+    # Each tuple contains the column name and the SQLite ALTER TABLE
+    # statement needed to add it.
+    migrations = []
 
+    if "conversation_id" not in columns:
+        migrations.append(
+            (
+                "conversation_id",
+                "ALTER TABLE chat_messages "
+                "ADD COLUMN conversation_id VARCHAR(100)",
+            )
+        )
+
+    if "account_id" not in columns:
+        migrations.append(
+            (
+                "account_id",
+                "ALTER TABLE chat_messages "
+                "ADD COLUMN account_id VARCHAR(50)",
+            )
+        )
+
+    if "rca" not in columns:
+        migrations.append(
+            (
+                "rca",
+                "ALTER TABLE chat_messages "
+                "ADD COLUMN rca TEXT",
+            )
+        )
+
+    if "recommendations" not in columns:
+        migrations.append(
+            (
+                "recommendations",
+                "ALTER TABLE chat_messages "
+                "ADD COLUMN recommendations TEXT",
+            )
+        )
+
+    if not migrations:
+        return
+
+    with engine.begin() as connection:
+        for _, sql in migrations:
+            connection.execute(text(sql))
+
+        # Existing records were created before these fields existed.
+        # Use session_id as a safe fallback for account_id and
+        # conversation_id so old chat history remains accessible.
+        if "conversation_id" not in columns:
             connection.execute(
                 text(
                     "UPDATE chat_messages "
                     "SET conversation_id = session_id "
                     "WHERE conversation_id IS NULL"
+                )
+            )
+
+        if "account_id" not in columns:
+            connection.execute(
+                text(
+                    "UPDATE chat_messages "
+                    "SET account_id = session_id "
+                    "WHERE account_id IS NULL"
                 )
             )
 
@@ -477,6 +532,7 @@ def list_aws_resources(session_id: str, service: str):
         "vpc": get_vpcs,
         "subnet": get_subnets,
         "security_group": get_security_groups,
+        "iam": get_iam_resources,
     }
 
     loader = loaders.get(service)
@@ -503,6 +559,11 @@ def list_aws_resources(session_id: str, service: str):
                 resource_id = item.get("vpc_id")
             elif service == "subnet":
                 resource_id = item.get("subnet_id")
+            elif service == "iam":
+                # IAM resources return their identifier in the generic `id` field.
+                # IAM is global and its resource kinds (user/role/group) are
+                # distinguished in the resource details.
+                resource_id = item.get("id") or item.get("name")
             else:
                 resource_id = item.get("group_id")
 
@@ -1041,7 +1102,7 @@ from fastapi import Body, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from aws_auth import get_aws_client
+from backend.aws_auth import get_aws_client
 
 
 class S3UploadRequest(BaseModel):
