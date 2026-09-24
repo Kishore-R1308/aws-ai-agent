@@ -169,6 +169,8 @@ DEFAULT_STATE = {
     "pending_batch_payload": None,
     "pending_action_id": None,
     "pending_action_payload": None,
+    "pending_chat_action_id": None,
+    "pending_chat_action_payload": None,
     "live_resources": [],
     "live_resources_service": None,
     "live_resources_refresh_needed": False,
@@ -240,10 +242,187 @@ def reset_pending_action():
     st.session_state.pending_action_payload = None
 
 
+def reset_pending_chat_action():
+    st.session_state.pending_chat_action_id = None
+    st.session_state.pending_chat_action_payload = None
+
+
+def display_chat_action_confirmation(action_plan, key_prefix):
+    """Display the secure confirmation UI for an ACTION planned from chat.
+
+    This uses the existing /aws/action/confirm endpoint. It does not execute
+    AWS directly from the frontend; execution remains behind the existing
+    explicit confirmation API.
+    """
+    if not isinstance(action_plan, dict):
+        return
+
+    if action_plan.get("validated") is not True:
+        return
+
+    action_id = action_plan.get("action_id")
+    if not action_id:
+        return
+
+    action = str(action_plan.get("action", "unknown")).upper()
+    resource_type = str(
+        action_plan.get("resource_type", "unknown")
+    )
+    parameters = action_plan.get("parameters") or {}
+    explanation = action_plan.get("explanation")
+
+    st.markdown("### 🔐 Confirm AWS Action")
+    st.warning(
+        "This operation can modify your live AWS environment. "
+        "Review the target and parameters before confirming."
+    )
+
+    with st.container(border=True):
+        summary_col, target_col = st.columns(2, gap="large")
+
+        with summary_col:
+            st.caption("Operation")
+            st.markdown(f"### {action}")
+
+        with target_col:
+            st.caption("Resource")
+            st.markdown(
+                f"### {resource_type.replace('_', ' ').title()}"
+            )
+
+        st.markdown("#### Target details")
+
+        sensitive_keys = {
+            "master_password",
+            "secret_key",
+            "access_key",
+            "password",
+            "token",
+            "zip_file",
+        }
+
+        if parameters:
+            for key, value in parameters.items():
+                label = key.replace("_", " ").title()
+                display_value = (
+                    "••••••••"
+                    if key.lower() in sensitive_keys
+                    else value
+                )
+                st.write(
+                    f"**{label}:** {display_value}"
+                )
+        else:
+            st.write("No additional parameters")
+
+        if explanation:
+            st.caption(f"Reason: {explanation}")
+
+        st.caption(
+            f"Action ID: `{action_id}`"
+        )
+
+        confirmation = st.text_input(
+            f"Type exactly: {CONFIRMATION_PHRASE}",
+            key=f"chat_action_confirmation_{key_prefix}",
+        )
+
+        confirm_col, cancel_col = st.columns(
+            2,
+            gap="medium",
+        )
+
+        with confirm_col:
+            confirm_clicked = st.button(
+                "🚀 Confirm and Execute",
+                use_container_width=True,
+                key=f"confirm_chat_action_{key_prefix}",
+                type="primary",
+            )
+
+        with cancel_col:
+            cancel_clicked = st.button(
+                "❌ Cancel",
+                use_container_width=True,
+                key=f"cancel_chat_action_{key_prefix}",
+            )
+
+        if cancel_clicked:
+            reset_pending_chat_action()
+            st.warning("AWS action cancelled.")
+            st.rerun()
+
+        if confirm_clicked:
+            if (
+                confirmation.strip()
+                != CONFIRMATION_PHRASE
+            ):
+                st.error("Incorrect confirmation phrase.")
+                return
+
+            try:
+                with st.spinner(
+                    "Executing AWS action..."
+                ):
+                    response = requests.post(
+                        f"{BACKEND_URL}/aws/action/confirm",
+                        json={
+                            "session_id": (
+                                st.session_state.session_id
+                            ),
+                            "action_id": action_id,
+                            "confirmation_phrase": (
+                                confirmation.strip()
+                            ),
+                        },
+                        timeout=300,
+                    )
+
+                if response.status_code == 200:
+                    try:
+                        response_data = response.json()
+                    except ValueError:
+                        response_data = {}
+
+                    store_action_result(
+                        response_data,
+                        {
+                            "action": action_plan.get("action"),
+                            "resource_type": resource_type,
+                            "parameters": parameters,
+                        },
+                    )
+                    mark_live_resources_for_refresh(
+                        resource_type
+                    )
+                    reset_pending_chat_action()
+
+                    # Keep the execution result visible after the rerun.
+                    # The chat confirmation flow previously stored the result
+                    # and immediately reran, but the navigation logic switched
+                    # back to Chat and cleared last_action_result before it could
+                    # be rendered.
+                    st.session_state.action_result_return_page = "Chat"
+                    st.session_state.resource_page = "Action Result"
+                    st.rerun()
+
+                else:
+                    show_error(
+                        response,
+                        "AWS action execution failed.",
+                    )
+
+            except requests.exceptions.RequestException as exc:
+                st.error(
+                    f"AWS action confirmation failed: {exc}"
+                )
+
+
 def mark_live_resources_for_refresh(resource_type):
     """Mark the affected service to refresh after a successful AWS action."""
     service_map = {
         "s3_bucket": "s3",
+        "s3_object": "s3",
         "ec2_instance": "ec2",
         "rds_instance": "rds",
         "lambda_function": "lambda",
@@ -266,6 +445,11 @@ def store_action_result(response_data, payload):
 
     identifier = (
         parameters.get("function_name")
+        or (
+            f"{parameters.get('bucket_name')}/{parameters.get('object_key')}"
+            if parameters.get("bucket_name") and parameters.get("object_key")
+            else None
+        )
         or parameters.get("bucket_name")
         or parameters.get("instance_id")
         or parameters.get("db_instance_identifier")
@@ -290,11 +474,17 @@ def store_action_result(response_data, payload):
     else:
         message = f"AWS {action} action completed successfully."
 
+    execution_status = response_data.get("execution_status") if isinstance(response_data, dict) else None
+    backend_result = response_data.get("result") if isinstance(response_data, dict) else None
+    result_status = backend_result.get("status") if isinstance(backend_result, dict) else None
+
     st.session_state.last_action_result = {
         "message": message,
         "action": action,
         "resource_type": resource_type,
         "identifier": identifier,
+        "execution_status": execution_status or result_status or "completed",
+        "result": backend_result if isinstance(backend_result, dict) else {},
     }
 
 
@@ -320,6 +510,22 @@ def display_action_result_page():
     st.success(
         f"✅ {result.get('message', 'AWS action completed successfully.')}"
     )
+
+    status = result.get("execution_status", "completed")
+    st.write(f"**Execution Status:** `{status}`")
+
+    result_payload = result.get("result") or {}
+    if isinstance(result_payload, dict):
+        resource_status = result_payload.get("status")
+        if resource_status and resource_status != status:
+            st.write(f"**AWS Operation Status:** `{resource_status}`")
+
+        if result_payload.get("bucket_name") and result_payload.get("object_key"):
+            st.write(
+                f"**S3 Object:** `{result_payload['bucket_name']}/{result_payload['object_key']}`"
+            )
+        if result_payload.get("file_path"):
+            st.write(f"**File:** `{result_payload['file_path']}`")
 
     return_page = st.session_state.get(
         "action_result_return_page",
@@ -410,6 +616,13 @@ def load_conversation(conversation_id):
                     "recommendations": item.get(
                         "recommendations"
                     ),
+                    "action_plan": item.get("action_plan"),
+                    "action_validation": item.get(
+                        "action_validation"
+                    ),
+                    "requires_confirmation": bool(
+                        item.get("requires_confirmation", False)
+                    ),
                     "message_key": (
                         f"history_{conversation_id}_{index}"
                     ),
@@ -429,6 +642,7 @@ def create_new_chat():
 
     reset_pending_batch()
     reset_pending_action()
+    reset_pending_chat_action()
 
 
 def delete_conversation(conversation_id):
@@ -545,7 +759,27 @@ def display_rca_recommendations(
         "Review executable actions",
         expanded=False,
     ):
-        st.json(valid_actions)
+        # Render RCA actions as a readable review table instead of raw JSON.
+        for index, action in enumerate(valid_actions, start=1):
+            with st.container(border=True):
+                st.markdown(f"**Action {index}: {str(action.get('action', '')).upper()}**")
+                st.write(f"**Resource:** {str(action.get('resource_type', '')).replace('_', ' ').title()}")
+                parameters = action.get('parameters') or {}
+                if parameters:
+                    st.markdown("**Parameters**")
+                    for key, value in parameters.items():
+                        label = str(key).replace('_', ' ').title()
+                        if isinstance(value, (dict, list)):
+                            st.write(f"**{label}:**")
+                            st.write(value)
+                        else:
+                            st.write(f"**{label}:** `{value}`")
+                explanation = action.get('explanation') or action.get('reason')
+                if explanation:
+                    st.caption(f"Reason: {explanation}")
+                status = action.get('status')
+                if status:
+                    st.caption(f"Status: {status}")
 
     current_batch_id = st.session_state.pending_batch_id
 
@@ -770,6 +1004,194 @@ def post_action_plan(action_type, resource_type, parameters, explanation):
     except requests.exceptions.RequestException as exc:
         st.error(f"Action planning request failed: {exc}")
 
+
+
+def post_chat_action_plan(action_type, resource_type, parameters, explanation):
+    """Plan an action completed from chat without leaving the Chat page."""
+    payload = {
+        "session_id": st.session_state.session_id,
+        "action": action_type,
+        "resource_type": resource_type,
+        "parameters": parameters,
+        "explanation": explanation,
+    }
+    try:
+        with st.spinner("Preparing AWS action..."):
+            response = requests.post(
+                f"{BACKEND_URL}/aws/action/plan",
+                json=payload,
+                timeout=30,
+            )
+        if response.status_code != 200:
+            show_error(response, "Could not plan AWS action.")
+            return False
+
+        data = response.json()
+        action_data = data.get("action", data)
+        action_id = action_data.get("action_id") or action_data.get("id")
+        if not action_id:
+            st.error("Backend did not return an action ID.")
+            return False
+
+        pending_payload = {
+            "action": action_type,
+            "resource_type": resource_type,
+            "parameters": parameters,
+            "explanation": explanation,
+            "validated": True,
+            "action_id": action_id,
+            "status": action_data.get("status", "pending"),
+        }
+        st.session_state.pending_chat_action_id = action_id
+        st.session_state.pending_chat_action_payload = pending_payload
+        return True
+    except requests.exceptions.RequestException as exc:
+        st.error(f"Action planning request failed: {exc}")
+        return False
+
+
+def display_chat_action_completion(action_plan, key_prefix):
+    """Complete missing S3 object action inputs from the chat UI."""
+    if not isinstance(action_plan, dict):
+        return
+    action = str(action_plan.get("action", "")).strip().lower()
+    resource_type = str(action_plan.get("resource_type", "")).strip().lower()
+    if resource_type != "s3_object" or action not in {"upload", "download"}:
+        return
+
+    parameters = dict(action_plan.get("parameters") or {})
+    missing = action_plan.get("missing_fields") or []
+    if not missing:
+        return
+
+    st.markdown("### 📁 Complete S3 File Action")
+    st.info("The AWS action is not executable yet. Provide the missing file details below; nothing will be executed until you confirm the final action.")
+
+    bucket_name = str(parameters.get("bucket_name") or "").strip()
+    if bucket_name:
+        st.write(f"**Bucket:** `{bucket_name}`")
+    else:
+        st.error("The S3 bucket name is missing from the action plan.")
+        return
+
+    if action == "upload":
+        uploaded_file = st.file_uploader(
+            "Choose the local file to upload",
+            key=f"chat_s3_upload_{key_prefix}",
+        )
+        default_key = parameters.get("object_key") or ""
+        object_key = st.text_input(
+            "S3 object key",
+            value=default_key,
+            placeholder="reports/myfile.csv",
+            key=f"chat_s3_upload_key_{key_prefix}",
+        ).strip()
+
+        if st.button(
+            "Prepare Upload Action",
+            key=f"chat_s3_prepare_upload_{key_prefix}",
+            use_container_width=True,
+            type="primary",
+        ):
+            if uploaded_file is None:
+                st.error("Choose a local file first.")
+                return
+            if not object_key:
+                st.error("Enter the S3 object key.")
+                return
+
+            import tempfile
+            temp_dir = tempfile.gettempdir()
+            safe_name = os.path.basename(uploaded_file.name) or "upload.bin"
+            temp_path = os.path.join(
+                temp_dir,
+                f"aws_ai_agent_chat_{uuid.uuid4().hex}_{safe_name}",
+            )
+            with open(temp_path, "wb") as handle:
+                handle.write(uploaded_file.getvalue())
+
+            st.session_state.setdefault("chat_upload_temp_files", set()).add(temp_path)
+            parameters.update({
+                "bucket_name": bucket_name,
+                "object_key": object_key,
+                "file_path": temp_path,
+            })
+            if post_chat_action_plan(
+                "upload",
+                "s3_object",
+                parameters,
+                "Upload the selected local file to the requested S3 object.",
+            ):
+                st.rerun()
+
+    elif action == "download":
+        object_key = str(parameters.get("object_key") or "").strip()
+        if not object_key:
+            try:
+                response = requests.get(
+                    f"{BACKEND_URL}/aws/s3/objects/{st.session_state.session_id}",
+                    params={"bucket_name": bucket_name},
+                    timeout=60,
+                )
+                objects_data = _backend_json_response(
+                    response,
+                    "Could not load S3 objects for download.",
+                )
+                objects = objects_data.get("objects", []) if isinstance(objects_data, dict) else []
+                keys = []
+                for item in objects:
+                    if isinstance(item, dict):
+                        key = item.get("key") or item.get("Key") or item.get("object_key")
+                        if key:
+                            keys.append(key)
+                    elif isinstance(item, str):
+                        keys.append(item)
+                if not keys:
+                    st.info("No S3 objects are available in this bucket.")
+                    return
+                object_key = st.selectbox(
+                    "Select the S3 object to download",
+                    keys,
+                    key=f"chat_s3_download_object_{key_prefix}",
+                )
+            except requests.exceptions.RequestException as exc:
+                st.error(f"Could not load S3 objects: {exc}")
+                return
+        else:
+            st.write(f"**Object:** `{object_key}`")
+
+        default_name = os.path.basename(object_key.rstrip("/")) or "downloaded_file"
+        destination = st.text_input(
+            "Local destination path",
+            value=os.path.join(os.path.expanduser("~/Downloads"), default_name),
+            key=f"chat_s3_download_path_{key_prefix}",
+        ).strip()
+
+        if st.button(
+            "Prepare Download Action",
+            key=f"chat_s3_prepare_download_{key_prefix}",
+            use_container_width=True,
+            type="primary",
+        ):
+            if not object_key:
+                st.error("Select an S3 object first.")
+                return
+            if not destination:
+                st.error("Enter a local destination path.")
+                return
+
+            parameters.update({
+                "bucket_name": bucket_name,
+                "object_key": object_key,
+                "file_path": destination,
+            })
+            if post_chat_action_plan(
+                "download",
+                "s3_object",
+                parameters,
+                "Download the selected S3 object to the requested local path.",
+            ):
+                st.rerun()
 
 def render_resource_fields(action_type, resource_type):
     """Render dynamic fields and return the parameters dictionary."""
@@ -1621,7 +2043,14 @@ def get_live_resource_actions(service, details=None):
         actions += ["delete"]
         return actions
     if service == "s3":
-        return ["view_details", "view_files", "upload_file", "download_file", "delete"]
+        return [
+            "view_details",
+            "view_files",
+            "upload_file",
+            "download_file",
+            "delete_file",
+            "delete",
+        ]
     if service == "rds":
         state = str(details.get("status") or "unknown").lower()
         actions = ["view_details"]
@@ -1797,7 +2226,9 @@ def render_s3_object_tools(session_id, bucket_name, resource_key, mode="view_fil
                             "Refresh View Files to verify it."
                         )
                         st.success("Upload completed successfully.")
-                        st.json(data)
+                        st.info(
+                            f"S3 object: {bucket_name}/{upload_key.strip()}"
+                        )
                     else:
                         st.error("Upload did not return a success response.")
                 except requests.exceptions.RequestException as exc:
@@ -1861,6 +2292,36 @@ def render_s3_object_tools(session_id, bucket_name, resource_key, mode="view_fil
             hide_index=True,
         )
         st.caption(f"{len(file_rows)} file(s) found in AWS S3 bucket '{bucket_name}'.")
+        return
+
+    if mode == "delete_file":
+        st.markdown("#### Delete S3 Object")
+        st.warning(
+            "Deleting an S3 object is irreversible. Review the exact object key before preparing the action."
+        )
+        selected_delete_label = st.selectbox(
+            "Select S3 object to delete",
+            list(object_lookup.keys()),
+            key=f"s3_delete_selected_object_{resource_key}",
+        )
+        selected_delete_key = object_lookup[selected_delete_label]
+        st.write(f"**Object:** `{selected_delete_key}`")
+        if st.button(
+            "Prepare Delete Object Action",
+            key=f"s3_delete_prepare_{resource_key}",
+            use_container_width=True,
+            type="primary",
+        ):
+            post_action_plan(
+                "delete",
+                "s3_object",
+                {
+                    "bucket_name": bucket_name,
+                    "object_key": selected_delete_key,
+                    "delete_confirmation": f"{bucket_name}/{selected_delete_key}",
+                },
+                f"User requested deletion of S3 object {bucket_name}/{selected_delete_key}.",
+            )
         return
 
     selected_label = st.selectbox(
@@ -2016,6 +2477,7 @@ def render_live_resource_action(service, details, resource_id, resource_name, in
         "view_files": "📄 View Files",
         "upload_file": "⬆️ Upload File",
         "download_file": "⬇️ Download File",
+        "delete_file": "🗑️ Delete File",
         "view_logs": "📊 View Logs",
         "view_rules": "🛡️ View Rules",
         "start": "▶️ Start",
@@ -2053,7 +2515,7 @@ def render_live_resource_action(service, details, resource_id, resource_name, in
                     st.session_state[detail_key] = not st.session_state.get(detail_key, False)
                     st.rerun()
 
-                if selected in {"view_files", "upload_file", "download_file", "view_logs", "view_rules"}:
+                if selected in {"view_files", "upload_file", "download_file", "delete_file", "view_logs", "view_rules"}:
                     st.session_state[active_action_key] = selected
                     st.rerun()
 
@@ -2074,7 +2536,7 @@ def render_live_resource_action(service, details, resource_id, resource_name, in
     if active_action == "view_rules":
         render_security_group_rules(details)
 
-    if active_action in {"view_files", "upload_file", "download_file"}:
+    if active_action in {"view_files", "upload_file", "download_file", "delete_file"}:
         if service != "s3":
             st.warning("This action is only available for S3 buckets.")
         else:
@@ -2432,6 +2894,7 @@ with st.sidebar:
 
                     reset_pending_batch()
                     reset_pending_action()
+                    reset_pending_chat_action()
 
                     load_conversations()
 
@@ -2474,10 +2937,24 @@ with st.sidebar:
             ["Chat", "Create Resource", "Live Resources"],
             key="resource_page_selector",
         )
+        # The radio is the source of truth for normal navigation.
+        # A previous action result must not trap the user on the result page
+        # and prevent the Chat input from rendering.
         if st.session_state.get("pending_action_id"):
             st.session_state.resource_page = "Create Resource"
-        elif st.session_state.get("last_action_result"):
+        elif (
+            st.session_state.get("resource_page") == "Action Result"
+            and st.session_state.get("last_action_result")
+        ):
+            # Preserve the completed-action page for the rerun immediately
+            # after confirmation. The user can return to Chat with the Back
+            # button, after which normal radio navigation resumes.
             st.session_state.resource_page = "Action Result"
+        elif selected_resource_page == "Chat":
+            st.session_state.resource_page = "Chat"
+            # Once the user explicitly returns to Chat, dismiss the old
+            # dedicated action-result page so st.chat_input can render.
+            st.session_state.last_action_result = None
         else:
             st.session_state.resource_page = selected_resource_page
         st.divider()
@@ -2525,6 +3002,28 @@ if resource_page != "Chat":
 st.divider()
 st.subheader("💬 Chat")
 
+# Show the most recent successful chat action execution immediately after
+# confirmation. The backend returns both execution_status and the AWS result
+# status (for example, `uploaded` for an S3 upload).
+chat_action_result = st.session_state.get("last_action_result")
+if isinstance(chat_action_result, dict):
+    st.success(
+        f"✅ {chat_action_result.get('message', 'AWS action completed successfully.')}"
+    )
+    st.caption(
+        f"Execution status: `{chat_action_result.get('execution_status', 'completed')}`"
+    )
+    result_payload = chat_action_result.get("result") or {}
+    if isinstance(result_payload, dict):
+        aws_status = result_payload.get("status")
+        if aws_status:
+            st.write(f"**AWS operation status:** `{aws_status}`")
+        if result_payload.get("bucket_name") and result_payload.get("object_key"):
+            st.write(
+                f"**S3 object:** `{result_payload['bucket_name']}/{result_payload['object_key']}`"
+            )
+        if result_payload.get("file_path"):
+            st.write(f"**File:** `{result_payload['file_path']}`")
 
 for message in st.session_state.messages:
     with st.chat_message("user"):
@@ -2542,6 +3041,40 @@ for message in st.session_state.messages:
         if recommendations:
             display_rca_recommendations(
                 recommendations,
+                message.get(
+                    "message_key",
+                    str(uuid.uuid4()),
+                ),
+            )
+
+        action_plan = message.get("action_plan")
+        if (
+            message.get("intent") == "ACTION"
+            and isinstance(action_plan, dict)
+            and action_plan.get("validated") is True
+            and action_plan.get("action_id")
+            and (
+                action_plan.get("action_id")
+                == st.session_state.get("pending_chat_action_id")
+            )
+        ):
+            display_chat_action_confirmation(
+                action_plan,
+                message.get(
+                    "message_key",
+                    str(uuid.uuid4()),
+                ),
+            )
+        elif (
+            message.get("intent") == "ACTION"
+            and isinstance(action_plan, dict)
+            and action_plan.get("validated") is not True
+            and not st.session_state.get("pending_chat_action_id")
+            and str(action_plan.get("resource_type", "")).strip().lower() == "s3_object"
+            and str(action_plan.get("action", "")).strip().lower() in {"upload", "download"}
+        ):
+            display_chat_action_completion(
+                action_plan,
                 message.get(
                     "message_key",
                     str(uuid.uuid4()),
@@ -2617,6 +3150,13 @@ if prompt:
                 recommendations = data.get(
                     "recommendations"
                 )
+                action_plan = data.get("action_plan")
+                action_validation = data.get(
+                    "action_validation"
+                )
+                requires_confirmation = bool(
+                    data.get("requires_confirmation", False)
+                )
 
                 st.write(answer)
 
@@ -2624,6 +3164,46 @@ if prompt:
                     display_rca_recommendations(
                         recommendations,
                         f"current_{uuid.uuid4().hex}",
+                    )
+
+                if (
+                    intent == "ACTION"
+                    and requires_confirmation
+                    and isinstance(action_plan, dict)
+                    and action_plan.get("validated") is True
+                    and action_plan.get("action_id")
+                ):
+                    st.session_state.pending_chat_action_id = (
+                        action_plan["action_id"]
+                    )
+                    st.session_state.pending_chat_action_payload = (
+                        action_plan
+                    )
+
+                    display_chat_action_confirmation(
+                        action_plan,
+                        f"current_{uuid.uuid4().hex}",
+                    )
+
+                elif (
+                    intent == "ACTION"
+                    and isinstance(action_plan, dict)
+                    and action_plan.get("validated") is not True
+                    and str(action_plan.get("resource_type", "")).strip().lower() == "s3_object"
+                    and str(action_plan.get("action", "")).strip().lower() in {"upload", "download"}
+                ):
+                    display_chat_action_completion(
+                        action_plan,
+                        f"current_{uuid.uuid4().hex}",
+                    )
+
+                elif (
+                    intent == "ACTION"
+                    and action_validation
+                    and not requires_confirmation
+                ):
+                    st.warning(
+                        f"AWS action validation: {action_validation}"
                     )
 
                 caption = f"Intent: {intent}"
@@ -2647,6 +3227,13 @@ if prompt:
                         "rca": data.get("rca"),
                         "recommendations": (
                             recommendations
+                        ),
+                        "action_plan": action_plan,
+                        "action_validation": (
+                            action_validation
+                        ),
+                        "requires_confirmation": (
+                            requires_confirmation
                         ),
                         "message_key": (
                             uuid.uuid4().hex

@@ -914,3 +914,79 @@ def get_inspector_findings(session_id, query=None):
     }
 
  
+# ---------------------------------------------------------------------------
+# S3 object inventory and file operations
+# ---------------------------------------------------------------------------
+
+def get_s3_objects(session_id: str, bucket_name: str, prefix: str = ""):
+    """Return the actual objects stored in an S3 bucket."""
+    s3 = get_aws_client(session_id, "s3")
+    paginator = s3.get_paginator("list_objects_v2")
+    objects = []
+    for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix or ""):
+        for obj in page.get("Contents", []):
+            objects.append({
+                "key": obj.get("Key"),
+                "size": obj.get("Size"),
+                "last_modified": str(obj.get("LastModified")),
+                "etag": obj.get("ETag"),
+                "storage_class": obj.get("StorageClass"),
+            })
+    return objects
+
+
+def upload_s3_object(
+    session_id: str,
+    bucket_name: str,
+    object_key: str,
+    file_path: str,
+    content_type: str | None = None,
+):
+    """Upload a local file to an S3 object."""
+    s3 = get_aws_client(session_id, "s3")
+    extra_args = {"ContentType": content_type} if content_type else None
+    if extra_args:
+        s3.upload_file(file_path, bucket_name, object_key, ExtraArgs=extra_args)
+    else:
+        s3.upload_file(file_path, bucket_name, object_key)
+    return {
+        "success": True,
+        "bucket": bucket_name,
+        "key": object_key,
+        "file_path": file_path,
+        "status": "uploaded",
+    }
+
+
+def download_s3_object(
+    session_id: str,
+    bucket_name: str,
+    object_key: str,
+    file_path: str,
+):
+    """Download an S3 object to a local file path."""
+    s3 = get_aws_client(session_id, "s3")
+    s3.download_file(bucket_name, object_key, file_path)
+    return {
+        "success": True,
+        "bucket": bucket_name,
+        "key": object_key,
+        "file_path": file_path,
+        "status": "downloaded",
+    }
+
+
+def delete_s3_object(
+    session_id: str,
+    bucket_name: str,
+    object_key: str,
+):
+    """Delete one object from an S3 bucket."""
+    s3 = get_aws_client(session_id, "s3")
+    s3.delete_object(Bucket=bucket_name, Key=object_key)
+    return {
+        "success": True,
+        "bucket": bucket_name,
+        "key": object_key,
+        "status": "deleted",
+    }

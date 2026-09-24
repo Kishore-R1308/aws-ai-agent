@@ -1,5 +1,7 @@
 import json
 import os
+import inspect
+import re
 from typing import TypedDict
 
 from langchain_openai import ChatOpenAI
@@ -10,6 +12,7 @@ from backend.aws_tools import (
     get_rds_instances,
     get_s3_buckets,
     get_s3_storage_summary,
+    get_s3_objects,
     get_vpcs,
     get_subnets,
     get_internet_gateways,
@@ -41,6 +44,7 @@ TOOL_MAP = {
     "get_ec2_instances": get_ec2_instances,
     "get_s3_buckets": get_s3_buckets,
     "get_s3_storage_summary": get_s3_storage_summary,
+    "get_s3_objects": get_s3_objects,
     "get_rds_instances": get_rds_instances,
     "get_vpcs": get_vpcs,
     "get_subnets": get_subnets,
@@ -78,12 +82,17 @@ class AgentState(TypedDict, total=False):
     # Existing agent state
     intent: str
     tools: list[str]
+    tool_parameters: dict
     context: str
     service: str
     tool_result: str
     rca: str
     recommendations: str
     answer: str
+
+    # ACTION intent state
+    action_plan: dict
+    action_validation: str
 
 
 # =====================================================
@@ -192,6 +201,195 @@ planner_llm = ChatOpenAI(
 # PLANNER NODE
 # =====================================================
 
+
+def _clean_json_text(raw: str) -> str:
+    """Remove common Markdown wrappers around an LLM JSON response."""
+    text = str(raw or "").strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    return text
+
+
+def _parse_json_object(raw: str):
+    """Parse the first JSON object from an LLM response."""
+    text = _clean_json_text(raw)
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            parsed, _ = decoder.raw_decode(text[index:])
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            continue
+
+    raise ValueError("LLM did not return a valid JSON object")
+
+
+def _invoke_json(prompt: str, purpose: str = "planner") -> dict:
+    """Invoke the planner and repair malformed JSON once through the LLM."""
+    response = planner_llm.invoke(prompt)
+    raw = str(response.content or "").strip()
+
+    try:
+        parsed = _parse_json_object(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception as first_error:
+        repair_prompt = f"""
+You are a strict JSON repair layer for an AWS planning system.
+
+The previous model attempted to answer the {purpose} request but returned
+invalid JSON. Repair it without changing its meaning.
+Do not invent AWS resource values, IDs, credentials, files, or parameters.
+Return ONLY one valid JSON object. No Markdown and no explanation.
+
+ORIGINAL REQUEST/PROMPT:
+{prompt}
+
+INVALID MODEL OUTPUT:
+{raw}
+
+Return the corrected JSON object now.
+"""
+        repair_response = planner_llm.invoke(repair_prompt)
+        repaired_raw = str(repair_response.content or "").strip()
+        try:
+            repaired = _parse_json_object(repaired_raw)
+            if isinstance(repaired, dict):
+                return repaired
+        except Exception:
+            raise ValueError(
+                f"{purpose.capitalize()} planner returned invalid JSON."
+            ) from first_error
+
+    raise ValueError(f"{purpose.capitalize()} planner returned invalid JSON.")
+
+
+def _required_tool_parameters(tool_names: list[str]) -> dict[str, list[str]]:
+    """Discover required tool parameters from the actual Python call signatures."""
+    requirements = {}
+    for tool_name in tool_names:
+        tool_function = TOOL_MAP.get(tool_name)
+        if tool_function is None:
+            continue
+        try:
+            signature = inspect.signature(tool_function)
+        except (TypeError, ValueError):
+            continue
+
+        required = []
+        for parameter in signature.parameters.values():
+            if parameter.name == "session_id":
+                continue
+            if parameter.kind in {
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            }:
+                continue
+            if parameter.default is inspect.Parameter.empty:
+                required.append(parameter.name)
+        if required:
+            requirements[tool_name] = required
+    return requirements
+
+
+def _repair_tool_parameters(
+    query: str,
+    resolved_query: str,
+    history_text: str,
+    tools: list[str],
+    current_parameters: dict,
+) -> dict:
+    """Ask the LLM to fill only missing live-tool parameters from user context."""
+    requirements = _required_tool_parameters(tools)
+    if not requirements:
+        return current_parameters
+
+    missing = {}
+    for tool_name, fields in requirements.items():
+        supplied = current_parameters.get(tool_name, {})
+        if not isinstance(supplied, dict):
+            supplied = {}
+        missing_fields = [
+            field for field in fields
+            if field not in supplied or supplied[field] in (None, "")
+        ]
+        if missing_fields:
+            missing[tool_name] = missing_fields
+
+    if not missing:
+        return current_parameters
+
+    repair_prompt = f"""
+You are the parameter-resolution layer of an AWS monitoring planner.
+
+Resolve ONLY parameters that are explicitly supported by the current user
+request or the immediately previous turn. Never invent values.
+The selected tools and their required parameters are:
+{json.dumps(missing, indent=2)}
+
+CURRENT USER REQUEST:
+{query}
+
+RESOLVED QUERY:
+{resolved_query}
+
+PREVIOUS TURN:
+{history_text}
+
+PARAMETERS ALREADY SUPPLIED:
+{json.dumps(current_parameters, indent=2, default=str)}
+
+Return ONLY this JSON shape:
+{{
+  "tool_parameters": {{
+    "tool_name": {{"parameter": "value"}}
+  }}
+}}
+
+For example, if the request says "files in bucket abc", return:
+{{
+  "tool_parameters": {{
+    "get_s3_objects": {{"bucket_name": "abc"}}
+  }}
+}}
+If a required value is not actually present in the request/context, leave
+that field absent. Do not guess.
+"""
+
+    repaired = _invoke_json(repair_prompt, "monitoring parameter")
+    additions = repaired.get("tool_parameters", {})
+    if not isinstance(additions, dict):
+        return current_parameters
+
+    merged = dict(current_parameters)
+    for tool_name, params in additions.items():
+        if tool_name not in TOOL_MAP or not isinstance(params, dict):
+            continue
+        existing = merged.get(tool_name, {})
+        if not isinstance(existing, dict):
+            existing = {}
+        existing = dict(existing)
+        for key, value in params.items():
+            if value is not None and str(value).strip() != "":
+                existing[str(key)] = value
+        merged[tool_name] = existing
+    return merged
+
 def planner_node(state):
 
     history_text = format_relevant_context(state.get("history", []))
@@ -218,6 +416,16 @@ IMPORTANT CONTEXT RULES:
    current question.
 7. Do not invent information that is not supported by the current question
    or the immediately previous turn.
+8. IMPORTANT ACTION FOLLOW-UP RULE: if the immediately previous assistant
+   message says an AWS action is missing a specific required field, and the
+   current message is a short value that can supply that field, treat the
+   current message as the answer to that missing field. Do not block it merely
+   because the short value is not independently an AWS question.
+9. Example: if the previous assistant says it still needs `bucket_name`
+   for `create` + `s3_bucket`, and the current user says `kishore949840`,
+   resolve the request as `Create an S3 bucket named kishore949840`.
+10. This rule is context resolution, not keyword-based intent routing: use
+    the previous assistant response and the current value together.
 
 Your responsibilities:
 
@@ -228,6 +436,7 @@ Your responsibilities:
 - KNOWLEDGE
 - MONITORING
 - RCA
+- ACTION
 5. Allow educational security questions.
 
 =====================================================
@@ -253,6 +462,20 @@ The resolved query must include context from the conversation when necessary.
 If the current query is already complete, keep its meaning unchanged.
 
 If the current query depends on previous conversation, resolve the missing context using the conversation history.
+
+ACTION FOLLOW-UP EXAMPLE:
+Previous conversation:
+User: create s3
+Assistant: I can prepare `create` for `s3_bucket`, but I still need: bucket_name.
+Current query:
+kishore949840
+Resolved query:
+Create an S3 bucket named kishore949840
+
+When the previous assistant explicitly asks for one missing action parameter,
+a short current value should be used as that parameter when it is the natural
+continuation. Do not classify such a value as BLOCKED just because it is not
+AWS-related on its own.
 
 Examples:
 
@@ -368,10 +591,14 @@ For allowed AWS queries, return:
 {{
     "allowed": true,
     "reason": "",
-    "intent": "KNOWLEDGE",
+    "intent": "KNOWLEDGE | MONITORING | RCA | ACTION",
     "tools": [],
     "services": [],
-    "resolved_query": ""
+    "resolved_query": "",
+    "tool_parameters": {{}},
+    "action": "",
+    "resource_type": "",
+    "parameters": {{}}
 }}
 
 For blocked queries, return:
@@ -392,6 +619,7 @@ AVAILABLE TOOLS
 get_ec2_instances
 get_s3_buckets
 get_s3_storage_summary
+get_s3_objects
 get_rds_instances
 get_vpcs
 get_subnets
@@ -436,6 +664,13 @@ IMPORTANT CLASSIFICATION RULE:
 - "List all VPCs and their CIDR blocks" MUST use MONITORING with tools ["get_vpcs"].
 - "List all EC2 instances" MUST use MONITORING with tools ["get_ec2_instances"].
 - "List all S3 buckets" MUST use MONITORING with tools ["get_s3_buckets"].
+- "What files are in bucket X" MUST use MONITORING with tool get_s3_objects and pass the bucket name as that tool's parameter.
+- When a monitoring tool requires a resource identifier, put the identifier in tool_parameters; do not encode it only in prose.
+- The tool_parameters object MUST map each selected tool to its arguments.
+- Example: for "What files are in bucket abcdegg123456kishore", return:
+  "tools": ["get_s3_objects"],
+  "tool_parameters": {{"get_s3_objects": {{"bucket_name": "abcdegg123456kishore"}}}}
+- Do not omit tool_parameters when a selected tool has required arguments.
 - KNOWLEDGE is only for conceptual or documentation questions.
 
 This includes:
@@ -461,14 +696,21 @@ asking why a problem occurred. If they ask why a problem
 occurred, classify the request as RCA.
 
 ACTION-REQUEST CLASSIFICATION RULES:
-- Requests to recommend, plan, prepare, remediate, or generate an
-  executable AWS action must be classified as RCA.
-- Live resource actions start, stop, reboot, enable, and disable
-  must be classified as RCA when requested for AWS resources.
-- EC2: start, stop, reboot. RDS: start, stop. Lambda: enable, disable.
-- A request that only lists or reports status remains MONITORING.
-- Never execute an action during planning; approval and confirmation
-  are required before execution.
+- Requests that ask the assistant to CREATE, DELETE, START, STOP, REBOOT,
+  ENABLE, DISABLE, UPLOAD, or DOWNLOAD an AWS resource/object must be ACTION.
+- Requests to plan or prepare one of those executable AWS operations are ACTION.
+- ACTION is for an operation the user wants performed, not for merely
+  explaining how an operation works.
+- A request that only lists, shows, checks, or reports status remains MONITORING.
+- RCA is reserved for diagnosis, causes, failures, anomalies, and incident analysis.
+- Never execute an action during planning. The action must be validated,
+  presented for approval, and explicitly confirmed through the API before execution.
+- Explicit examples: "create S3 bucket" is ACTION; "create EC2 instance" is ACTION;
+  "upload a file to bucket X" is ACTION; "download file Y from bucket X" is ACTION.
+- Missing action parameters must remain missing. Never create defaults such as a bucket name,
+  AMI ID, VPC CIDR, instance type, key name, or resource name unless the user supplied them.
+- Supported ACTION resource types are: s3_bucket, s3_object, ec2_instance, rds_instance,
+  lambda_function, security_group, vpc, subnet, iam_resource.
 
 TAG / ACCOUNT-DATA RULES:
 - Requests for live data from the user's AWS account are MONITORING.
@@ -695,6 +937,207 @@ Q: Analyze latest alarm
 }}
 
 =====================================================
+ACTION EXAMPLES
+=====================================================
+
+Q: Create an S3 bucket named my-test-bucket-2026
+
+{{
+    "allowed": true,
+    "intent": "ACTION",
+    "reason": "",
+    "tools": [],
+    "services": ["S3"],
+    "resolved_query": "Create an S3 bucket named my-test-bucket-2026",
+    "action": "create",
+    "resource_type": "s3_bucket",
+    "parameters": {{
+        "bucket_name": "my-test-bucket-2026"
+    }}
+}}
+
+Q: I want to create a VPC
+
+{{
+    "allowed": true,
+    "intent": "ACTION",
+    "reason": "",
+    "tools": [],
+    "services": ["VPC"],
+    "resolved_query": "Create a VPC",
+    "action": "create",
+    "resource_type": "vpc",
+    "parameters": {{}}
+}}
+
+Q: I want to create an S3 bucket
+
+{{
+    "allowed": true,
+    "intent": "ACTION",
+    "reason": "",
+    "tools": [],
+    "services": ["S3"],
+    "resolved_query": "Create an S3 bucket",
+    "action": "create",
+    "resource_type": "s3_bucket",
+    "parameters": {{}}
+}}
+
+Q: Create an IAM role
+
+{{
+    "allowed": true,
+    "intent": "ACTION",
+    "reason": "",
+    "tools": [],
+    "services": ["IAM"],
+    "resolved_query": "Create an IAM role",
+    "action": "create",
+    "resource_type": "iam_resource",
+    "parameters": {{
+        "resource_kind": "role"
+    }}
+}}
+
+Q: Create an EC2 instance
+
+{{
+    "allowed": true,
+    "intent": "ACTION",
+    "reason": "",
+    "tools": [],
+    "services": ["EC2"],
+    "resolved_query": "Create an EC2 instance",
+    "action": "create",
+    "resource_type": "ec2_instance",
+    "parameters": {{}}
+}}
+
+Q: Create an RDS instance
+
+{{
+    "allowed": true,
+    "intent": "ACTION",
+    "reason": "",
+    "tools": [],
+    "services": ["RDS"],
+    "resolved_query": "Create an RDS instance",
+    "action": "create",
+    "resource_type": "rds_instance",
+    "parameters": {{}}
+}}
+
+Q: Create a Lambda function
+
+{{
+    "allowed": true,
+    "intent": "ACTION",
+    "reason": "",
+    "tools": [],
+    "services": ["Lambda"],
+    "resolved_query": "Create a Lambda function",
+    "action": "create",
+    "resource_type": "lambda_function",
+    "parameters": {{}}
+}}
+
+Q: Create a security group
+
+{{
+    "allowed": true,
+    "intent": "ACTION",
+    "reason": "",
+    "tools": [],
+    "services": ["EC2"],
+    "resolved_query": "Create a security group",
+    "action": "create",
+    "resource_type": "security_group",
+    "parameters": {{}}
+}}
+
+Q: Create a subnet
+
+{{
+    "allowed": true,
+    "intent": "ACTION",
+    "reason": "",
+    "tools": [],
+    "services": ["VPC"],
+    "resolved_query": "Create a subnet",
+    "action": "create",
+    "resource_type": "subnet",
+    "parameters": {{}}
+}}
+
+Q: Create a VPC named production-vpc with CIDR 10.0.0.0/16
+
+{{
+    "allowed": true,
+    "intent": "ACTION",
+    "reason": "",
+    "tools": [],
+    "services": ["VPC"],
+    "resolved_query": "Create a VPC named production-vpc with CIDR 10.0.0.0/16",
+    "action": "create",
+    "resource_type": "vpc",
+    "parameters": {{
+        "resource_name": "production-vpc",
+        "cidr_block": "10.0.0.0/16"
+    }}
+}}
+
+Q: Delete my S3 bucket my-test-bucket-2026
+
+{{
+    "allowed": true,
+    "intent": "ACTION",
+    "reason": "",
+    "tools": [],
+    "services": ["S3"],
+    "resolved_query": "Delete my S3 bucket my-test-bucket-2026",
+    "action": "delete",
+    "resource_type": "s3_bucket",
+    "parameters": {{
+        "bucket_name": "my-test-bucket-2026"
+    }}
+}}
+
+Q: Start EC2 instance i-0123456789abcdef0
+
+{{
+    "allowed": true,
+    "intent": "ACTION",
+    "reason": "",
+    "tools": [],
+    "services": ["EC2"],
+    "resolved_query": "Start EC2 instance i-0123456789abcdef0",
+    "action": "start",
+    "resource_type": "ec2_instance",
+    "parameters": {{
+        "instance_id": "i-0123456789abcdef0"
+    }}
+}}
+
+IMPORTANT ACTION UNDERSTANDING RULE:
+- Any clear request to create, delete, start, stop, reboot, enable, disable, upload, or download a supported AWS resource is ACTION.
+- Do not reinterpret a state-changing request as KNOWLEDGE just because the user did not provide all fields yet.
+- For create requests, identify the AWS resource from the user's language and return ACTION with the fields the user actually supplied.
+- If the user says only "create an IAM role", return resource_type=iam_resource and resource_kind=role with no invented resource name.
+- If the user says only "create a VPC", return resource_type=vpc with no invented name or CIDR.
+- If the user says only "create an S3 bucket", return resource_type=s3_bucket with no invented bucket name.
+- The ACTION node will use the same resource/action requirements as the Create Resource UI to determine missing fields.
+
+IMPORTANT ACTION RULE:
+- A state-changing AWS request is still an allowed AWS request.
+- Classify it as ACTION even when required parameters are missing.
+- Do NOT block an ACTION merely because a parameter is missing.
+- Missing parameters must be handled by the ACTION node's validation layer.
+- Do NOT invent missing parameter values.
+- Do NOT execute an action during planning.
+- The user must explicitly confirm through the existing confirmation API.
+
+=====================================================
 FINAL INSTRUCTION
 =====================================================
 
@@ -703,21 +1146,7 @@ Return ONLY the JSON object.
 
     try:
 
-        response = planner_llm.invoke(prompt)
-
-        raw = response.content.strip()
-
-        # Remove markdown code fences if the model returns them
-        if raw.startswith("```"):
-            raw = (
-                raw
-                .replace("```json", "")
-                .replace("```", "")
-                .strip()
-            )
-
-        # Convert JSON text to Python dictionary
-        plan = json.loads(raw)
+        plan = _invoke_json(prompt, "planner")
 
         allowed = plan.get(
             "allowed",
@@ -758,6 +1187,10 @@ Return ONLY the JSON object.
             []
         )
 
+        tool_parameters = plan.get("tool_parameters", {})
+        if not isinstance(tool_parameters, dict):
+            tool_parameters = {}
+
         resolved_query = plan.get(
             "resolved_query",
             state["query"]
@@ -774,63 +1207,17 @@ Return ONLY the JSON object.
         if not resolved_query:
             resolved_query = state["query"]
 
-        # Deterministic routing for common live AWS inventory requests.
-        # This prevents the LLM from incorrectly classifying account queries as KNOWLEDGE.
-        normalized_query = resolved_query.lower()
-        rca_markers = (
-            "root cause", "why did", "why is", "why are", "diagnose",
-            "diagnosis", "investigate", "troubleshoot", "what caused",
-            "high cpu", "cpu utilization is high", "performance issue",
-            "failure", "incident", "problem with", "anomaly"
+        tool_parameters = _repair_tool_parameters(
+            query=state["query"],
+            resolved_query=resolved_query,
+            history_text=history_text,
+            tools=tools,
+            current_parameters=tool_parameters,
         )
-        if any(marker in normalized_query for marker in rca_markers):
-            intent = "RCA"
-            if any(term in normalized_query for term in ("ec2", "instance", "cpu", "compute")):
-                tools = ["get_ec2_instances", "get_cloudwatch_metrics", "get_cloudwatch_alarms", "get_cloudtrail_events"]
-                services = ["EC2", "CloudWatch", "CloudTrail"]
 
-        action_request_markers = (
-            "recommend starting", "recommend stopping", "recommend rebooting",
-            "recommend enabling", "recommend disabling", "executable action",
-            "remediation action", "requires confirmation", "require confirmation",
-            "after my approval", "after approval", "plan an action", "prepare an action",
-            "start ", "stop ", "reboot ", "enable ", "disable "
-        )
-        is_action_request = any(marker in normalized_query for marker in action_request_markers)
-
-        if is_action_request:
-            intent = "RCA"
-            if any(term in normalized_query for term in ("rds", "database")):
-                tools = ["get_rds_instances"]
-                services = ["RDS"]
-            elif any(term in normalized_query for term in ("lambda", "function")):
-                tools = ["get_lambda_functions", "get_lambda_tags"]
-                services = ["Lambda"]
-            elif any(term in normalized_query for term in ("ec2", "instance", "cpu", "compute")):
-                tools = ["get_ec2_instances", "get_cloudwatch_metrics", "get_cloudwatch_alarms", "get_cloudtrail_events"]
-                services = ["EC2", "CloudWatch", "CloudTrail"]
-
-        if intent == "KNOWLEDGE":
-            if "list all vpc" in normalized_query and ("cidr" in normalized_query or "vpc" in normalized_query):
-                intent = "MONITORING"
-                tools = ["get_vpcs"]
-                services = ["VPC"]
-            elif "list all ec2" in normalized_query or "list my ec2" in normalized_query:
-                intent = "MONITORING"
-                tools = ["get_ec2_instances"]
-                services = ["EC2"]
-            elif "list all s3 bucket" in normalized_query or "list my s3 bucket" in normalized_query:
-                intent = "MONITORING"
-                tools = ["get_s3_buckets"]
-                services = ["S3"]
-            elif "list all rds" in normalized_query or "list my rds" in normalized_query:
-                intent = "MONITORING"
-                tools = ["get_rds_instances"]
-                services = ["RDS"]
-            elif "list all lambda" in normalized_query or "list my lambda" in normalized_query:
-                intent = "MONITORING"
-                tools = ["get_lambda_functions"]
-                services = ["Lambda"]
+        # The LLM planner is the source of truth for intent, tools, services, and resolved query.
+        # Python only validates that selected tools exist in TOOL_MAP; it does not
+        # override natural-language classification with keyword rules.
 
         print("\n===== PLANNER OUTPUT =====")
         print("Intent:", intent)
@@ -843,7 +1230,8 @@ Return ONLY the JSON object.
             "intent": intent,
             "tools": tools,
             "services": ", ".join(services),
-            "resolved_query": resolved_query
+            "resolved_query": resolved_query,
+            "tool_parameters": tool_parameters
         }
 
     except Exception as e:
@@ -858,6 +1246,425 @@ Return ONLY the JSON object.
             "answer": "Sorry. Unable to classify the request."
         }
 
+
+# =====================================================
+# ACTION NODE
+# =====================================================
+
+def action_node(state):
+    """
+    Convert an ACTION request into a structured pending action.
+
+    This node NEVER executes an AWS action. It:
+    1. asks the LLM to structure the requested action,
+    2. validates the parameters,
+    3. creates a pending action when valid,
+    4. returns the pending action id for explicit confirmation.
+
+    Actual AWS execution remains in the existing confirmation API.
+    """
+
+    query = state.get("resolved_query", state["query"])
+    history_text = format_last_turn(state.get("history", []))
+
+    prompt = f"""
+You are the AWS action-planning layer.
+
+Create a structured action request from the user's request.
+Do NOT execute anything.
+Do NOT invent resource IDs, names, ARNs, credentials, passwords, or files.
+Use the current request and the immediately previous turn only when the
+current request clearly refers to it.
+If the previous assistant asked for one missing required action parameter and
+the current request is a short value, use that value to complete the action.
+Example: previous assistant asks for `bucket_name` after `create s3`, current
+request is `kishore949840` -> create `s3_bucket` with `bucket_name` set to
+`kishore949840`. Do not invent any other fields.
+
+SUPPORTED ACTIONS:
+- create
+- delete
+- start
+- stop
+- reboot
+- enable
+- disable
+- upload
+- download
+
+SUPPORTED RESOURCE TYPES:
+- s3_bucket
+- s3_object
+- ec2_instance
+- rds_instance
+- lambda_function
+- security_group
+- vpc
+- subnet
+- iam_resource
+
+ACTION FIELD REQUIREMENTS:
+- s3_bucket create: bucket_name
+- s3_bucket delete: bucket_name, delete_confirmation
+- s3_object upload: bucket_name, object_key, file_path
+- s3_object download: bucket_name, object_key, file_path
+- s3_object delete: bucket_name, object_key, delete_confirmation
+- ec2_instance start/stop/reboot: instance_id
+- ec2_instance create: resource_name, ami_id, instance_type, key_name
+- ec2_instance delete: instance_id, delete_confirmation
+- rds_instance start/stop: db_instance_identifier
+- rds_instance create: db_instance_identifier, db_instance_class, engine, master_username, master_password
+- rds_instance delete: db_instance_identifier, delete_confirmation
+- lambda_function enable/disable: function_name
+- lambda_function create: function_name, runtime, role_arn, handler, zip_file
+- lambda_function delete: function_name, delete_confirmation
+- security_group create: group_name, description, vpc_id
+- security_group delete: group_id, delete_confirmation
+- vpc create: resource_name, cidr_block
+- vpc delete: vpc_id, delete_confirmation
+- subnet create: resource_name, vpc_id, cidr_block, availability_zone
+- subnet delete: subnet_id, delete_confirmation
+- iam_resource create: resource_name, resource_kind
+- iam_resource delete: resource_name, resource_kind, delete_confirmation
+
+For delete_confirmation, only provide it when the user explicitly supplied
+that exact resource identifier as the deletion target. Do not fabricate it.
+
+Q: What files are in bucket aws-123-unique1308
+
+{{
+  "action": "",
+  "resource_type": "",
+  "parameters": {{}},
+  "explanation": "S3 object inventory is monitoring, not an ACTION."
+}}
+
+Q: Delete file reports/report.csv from bucket aws-123-unique1308
+
+{{
+  "action": "delete",
+  "resource_type": "s3_object",
+  "parameters": {{
+    "bucket_name": "aws-123-unique1308",
+    "object_key": "reports/report.csv",
+    "delete_confirmation": "aws-123-unique1308/reports/report.csv"
+  }},
+  "explanation": "Delete the specified S3 object after explicit confirmation."
+}}
+
+Q: Download file reports/report.csv from bucket aws-123-unique1308 to C:/Users/me/Downloads/report.csv
+
+{{
+  "action": "download",
+  "resource_type": "s3_object",
+  "parameters": {{
+    "bucket_name": "aws-123-unique1308",
+    "object_key": "reports/report.csv",
+    "file_path": "C:/Users/me/Downloads/report.csv"
+  }},
+  "explanation": "Download the specified S3 object to the supplied local path after explicit confirmation."
+}}
+
+Q: Upload C:/Users/me/Documents/report.csv to bucket aws-123-unique1308 as reports/report.csv
+
+{{
+  "action": "upload",
+  "resource_type": "s3_object",
+  "parameters": {{
+    "bucket_name": "aws-123-unique1308",
+    "object_key": "reports/report.csv",
+    "file_path": "C:/Users/me/Documents/report.csv"
+  }},
+  "explanation": "Upload the specified local file to the S3 bucket after explicit confirmation."
+}}
+
+Q: Create an EC2 instance
+
+{{
+  "action": "create",
+  "resource_type": "ec2_instance",
+  "parameters": {{}},
+  "explanation": "The user requested EC2 creation but supplied no launch parameters."
+}}
+
+Q: Create an S3 bucket
+
+{{
+  "action": "create",
+  "resource_type": "s3_bucket",
+  "parameters": {{}},
+  "explanation": "The user requested S3 bucket creation but supplied no bucket name."
+}}
+
+Q: Create a VPC
+
+{{
+  "action": "create",
+  "resource_type": "vpc",
+  "parameters": {{}},
+  "explanation": "The user requested VPC creation but supplied no name or CIDR block."
+}}
+
+Q: Create a security group
+
+{{
+  "action": "create",
+  "resource_type": "security_group",
+  "parameters": {{}},
+  "explanation": "The user requested security-group creation but supplied no fields."
+}}
+
+PREVIOUS TURN:
+{history_text}
+
+CURRENT REQUEST:
+{query}
+
+Return ONLY JSON:
+{{
+  "action": "create|delete|start|stop|reboot|enable|disable|upload|download",
+  "resource_type": "",
+  "parameters": {{}},
+  "explanation": "",
+  "missing_fields": []
+}}
+"""
+
+    try:
+        parsed = _invoke_json(prompt, "action planner")
+
+        if not isinstance(parsed, dict):
+            raise ValueError("Action planner returned a non-object")
+
+        action = str(parsed.get("action", "")).strip().lower()
+        resource_type = str(
+            parsed.get("resource_type", "")
+        ).strip().lower()
+
+        parameters = parsed.get("parameters", {})
+        explanation = str(
+            parsed.get("explanation", "")
+        ).strip()
+
+        if not isinstance(parameters, dict):
+            parameters = {}
+
+        # Security/provenance guard:
+        # For a standalone destructive request such as "delete rds", do not
+        # accept identifiers that the LLM may have copied from the previous
+        # turn or invented from context. Previous-turn values are allowed only
+        # when the current message is clearly a short answer to a missing-field
+        # request (for example: "create s3" -> "my-bucket").
+        raw_current_query = str(state.get("query", "")).strip()
+        normalized_query = raw_current_query.lower()
+        previous_text = history_text.lower()
+
+        follow_up_to_missing_field = (
+            len(raw_current_query.split()) <= 6
+            and any(
+                marker in previous_text
+                for marker in (
+                    "still need",
+                    "i still need",
+                    "need:",
+                    "missing required",
+                    "missing:",
+                )
+            )
+        )
+
+        standalone_action_with_no_target = (
+            bool(re.search(
+                r"\b(delete|start|stop|reboot|enable|disable)\b",
+                normalized_query,
+            ))
+            and not follow_up_to_missing_field
+        )
+
+        if standalone_action_with_no_target:
+            # A target must be present in the current request itself.
+            # These are validation guards, not intent routing.
+            target_words = {
+                "delete", "start", "stop", "reboot", "enable", "disable",
+                "create", "upload", "download",
+                "aws", "amazon", "s3", "bucket", "object", "file",
+                "ec2", "instance", "instances",
+                "rds", "database", "db",
+                "lambda", "function", "functions",
+                "security", "group",
+                "vpc", "subnet", "iam", "resource",
+                "the", "a", "an", "this", "that", "my", "please",
+                "from", "to", "in", "on", "of",
+            }
+
+            current_tokens = re.findall(
+                r"[A-Za-z0-9_.:/\\-]+",
+                normalized_query,
+            )
+            explicit_target_tokens = [
+                token
+                for token in current_tokens
+                if token not in target_words
+            ]
+
+            if not explicit_target_tokens:
+                parameters = {}
+                explanation = (
+                    explanation
+                    if explanation and "previous" not in explanation.lower()
+                    else ""
+                )
+
+        # Keep only supplied action parameters.
+        parameters = {
+            str(k): v
+            for k, v in parameters.items()
+            if v is not None and str(v).strip() != ""
+        }
+
+        from backend.action_validation import validate_action
+        from backend.action_store import create_pending_action
+
+        valid, message = validate_action(
+            action,
+            resource_type,
+            parameters,
+        )
+
+        if valid:
+            validation_message = "Action parameters are complete."
+
+            # Create a pending action only.
+            # The existing confirmation endpoint remains responsible for
+            # approval and AWS execution.
+            pending_action = create_pending_action(
+                session_id=state["session_id"],
+                action=action,
+                resource_type=resource_type,
+                parameters=parameters,
+                explanation=(
+                    explanation
+                    or f"Proposed {action} operation for {resource_type}."
+                ),
+            )
+
+            action_id = pending_action.get("action_id")
+
+            action_plan = {
+                "action": action,
+                "resource_type": resource_type,
+                "parameters": parameters,
+                "explanation": explanation,
+                "missing_fields": [],
+                "validated": True,
+                "action_id": action_id,
+                "status": pending_action.get("status", "pending"),
+            }
+
+            parameter_lines = []
+            for key, value in parameters.items():
+                label = str(key).replace("_", " ").title()
+                if key.lower() in {
+                    "master_password",
+                    "secret_key",
+                    "access_key",
+                    "password",
+                    "token",
+                    "zip_file",
+                }:
+                    display_value = "••••••••"
+                else:
+                    display_value = str(value)
+                parameter_lines.append(
+                    f"- **{label}:** {display_value}"
+                )
+
+            parameter_text = (
+                "\n".join(parameter_lines)
+                if parameter_lines
+                else "- No additional parameters"
+            )
+
+            answer = (
+                "## AWS Action Plan\n\n"
+                f"**Action:** {action.title()}\n\n"
+                f"**Resource:** {resource_type.replace('_', ' ').title()}\n\n"
+                "**Parameters:**\n"
+                f"{parameter_text}\n\n"
+                f"**Action ID:** `{action_id}`\n\n"
+                "The action has been prepared and is awaiting your "
+                "explicit confirmation. No AWS action has been executed.\n\n"
+                "Type exactly `I CONFIRM THIS AWS ACTION` to approve this action."
+            )
+
+        else:
+            validation_message = message
+            missing_fields = []
+
+            if "Missing required field:" in message:
+                missing_fields = [
+                    message.split(
+                        "Missing required field:", 1
+                    )[1].strip()
+                ]
+            elif "Missing required fields:" in message:
+                missing_fields = [
+                    item.strip()
+                    for item in message.split(
+                        "Missing required fields:", 1
+                    )[1].split(",")
+                    if item.strip()
+                ]
+
+            action_plan = {
+                "action": action,
+                "resource_type": resource_type,
+                "parameters": parameters,
+                "explanation": explanation,
+                "missing_fields": missing_fields,
+                "validated": False,
+                "action_id": None,
+                "status": "not_created",
+            }
+
+            fields = (
+                ", ".join(missing_fields)
+                if missing_fields
+                else validation_message
+            )
+
+            answer = (
+                "## AWS Action\n\n"
+                f"I can prepare `{action or 'the requested'}` for "
+                f"`{resource_type or 'the AWS resource'}`, but I still "
+                f"need: **{fields}**.\n\n"
+                "Nothing has been executed and no pending action was created."
+            )
+
+        return {
+            "action_plan": action_plan,
+            "action_validation": validation_message,
+            "answer": answer,
+        }
+
+    except Exception as exc:
+        return {
+            "action_plan": {
+                "action": "",
+                "resource_type": "",
+                "parameters": {},
+                "explanation": "",
+                "missing_fields": [],
+                "validated": False,
+                "action_id": None,
+                "status": "not_created",
+            },
+            "action_validation": str(exc),
+            "answer": (
+                "I could not safely prepare the AWS action. "
+                "No AWS action was executed."
+            ),
+        }
 
 # =====================================================
 # KNOWLEDGE NODE
@@ -911,8 +1718,29 @@ def monitoring_node(state):
                 tool_name
             ]
 
+            tool_parameters = state.get("tool_parameters", {})
+            parameters = tool_parameters.get(tool_name, {})
+            if not isinstance(parameters, dict):
+                parameters = {}
+
+            required_fields = _required_tool_parameters([tool_name]).get(
+                tool_name, []
+            )
+            missing_fields = [
+                field
+                for field in required_fields
+                if field not in parameters
+                or parameters[field] in (None, "")
+            ]
+            if missing_fields:
+                raise ValueError(
+                    f"Missing required parameter(s) for {tool_name}: "
+                    + ", ".join(missing_fields)
+                )
+
             results[tool_name] = tool_function(
-                session_id
+                session_id,
+                **parameters
             )
 
         except Exception as e:
@@ -1310,6 +2138,8 @@ Rules:
 - Use the AWS results as the source of truth for account-specific information.
 - Do not invent AWS resources or values.
 - If the service is to be listed, provide it in tabular format.
+- If get_s3_objects returned object records, display the object keys/names, sizes, last-modified values, and storage class when available. Do not replace an object listing with only a storage summary.
+- If no objects are returned, clearly say the bucket contains no objects (or no matching objects for the requested prefix).
 
 Format:
 
@@ -1317,6 +2147,18 @@ Format:
 
 ## AWS Findings
 """
+
+    # =================================================
+    # ACTION
+    # =================================================
+
+    elif state["intent"] == "ACTION":
+        return {
+            "answer": state.get(
+                "answer",
+                "No AWS action was executed."
+            )
+        }
 
     # =================================================
     # RCA
@@ -1419,6 +2261,10 @@ def route_after_planner(state):
 
         return "knowledge"
 
+    if state["intent"] == "ACTION":
+
+        return "action"
+
     if state["intent"] == "RCA":
 
         return "monitoring"
@@ -1457,6 +2303,12 @@ builder.add_node(
 
 
 builder.add_node(
+    "action",
+    action_node,
+)
+
+
+builder.add_node(
     "rca",
     rca_node,
 )
@@ -1491,6 +2343,7 @@ builder.add_conditional_edges(
     route_after_planner,
     {
         "knowledge": "knowledge",
+        "action": "action",
         "monitoring": "monitoring",
         "final": "final"
     },
@@ -1499,6 +2352,12 @@ builder.add_conditional_edges(
 
 builder.add_edge(
     "knowledge",
+    "final",
+)
+
+
+builder.add_edge(
+    "action",
     "final",
 )
 
@@ -1566,5 +2425,13 @@ def run_agent(
         "rca": result.get("rca"),
         "recommendations": result.get(
             "recommendations"
+        ),
+        "action_plan": result.get(
+            "action_plan",
+            {}
+        ),
+        "action_validation": result.get(
+            "action_validation",
+            ""
         )
     }

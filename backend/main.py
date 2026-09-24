@@ -330,7 +330,21 @@ def chat(
     db.commit()
     db.refresh(record)
 
-    return result
+    # ACTION responses are planned by the agent and stored in the existing
+    # pending-action store. No AWS execution happens here.
+    action_plan = result.get("action_plan") or {}
+    requires_confirmation = bool(
+        result.get("intent") == "ACTION"
+        and action_plan.get("validated") is True
+        and action_plan.get("action_id")
+    )
+
+    return {
+        **result,
+        "action_plan": action_plan,
+        "action_validation": result.get("action_validation"),
+        "requires_confirmation": requires_confirmation,
+    }
 
 
 # =====================================================

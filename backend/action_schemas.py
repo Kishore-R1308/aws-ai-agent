@@ -4,14 +4,34 @@ from pydantic import BaseModel, Field
 
 class AWSActionRequest(BaseModel):
     session_id: str
-    action: Literal["create", "delete", "start", "stop", "reboot", "enable", "disable"]
+    action: Literal[
+        "create",
+        "delete",
+        "start",
+        "stop",
+        "reboot",
+        "enable",
+        "disable",
+        "upload",
+        "download",
+    ]
     resource_type: str
     parameters: Dict[str, Any] = Field(default_factory=dict)
 
 
 class AWSActionPlan(BaseModel):
     action_id: str
-    action: Literal["create", "delete", "start", "stop", "reboot", "enable", "disable"]
+    action: Literal[
+        "create",
+        "delete",
+        "start",
+        "stop",
+        "reboot",
+        "enable",
+        "disable",
+        "upload",
+        "download",
+    ]
     resource_type: str
     parameters: Dict[str, Any] = Field(default_factory=dict)
     explanation: str = ""
@@ -26,7 +46,15 @@ class AWSActionApprovalRequest(BaseModel):
 
 class RCARecommendedAction(BaseModel):
     action_id: str
-    action: Literal["create", "delete", "start", "stop", "reboot", "enable", "disable"]
+    action: Literal[
+        "create",
+        "delete",
+        "start",
+        "stop",
+        "reboot",
+        "enable",
+        "disable",
+    ]
     resource_type: str
     parameters: Dict[str, Any] = Field(default_factory=dict)
     explanation: str = ""

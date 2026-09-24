@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 import base64
 import io
 import json
+import os
 import re
 import zipfile
 
@@ -42,8 +43,11 @@ SUPPORTED_ACTIONS = {
     "reboot": {"ec2_instance"},
     "enable": {"lambda_function"},
     "disable": {"lambda_function"},
+    "upload": {"s3_object"},
+    "download": {"s3_object"},
     "delete": {
         "s3_bucket",
+        "s3_object",
         "ec2_instance",
         "rds_instance",
         "lambda_function",
@@ -85,6 +89,7 @@ def execute_aws_action(
 
     executors = {
         "s3_bucket": execute_s3,
+        "s3_object": execute_s3_object,
         "ec2_instance": execute_ec2,
         "rds_instance": execute_rds,
         "lambda_function": execute_lambda,
@@ -259,6 +264,117 @@ def execute_s3(
 
     raise ValueError(
         f"Unsupported S3 action: {action}"
+    )
+
+
+# =====================================================
+# 1B. S3 OBJECTS
+# =====================================================
+
+
+def _validate_file_path(parameters: Dict[str, Any], field: str) -> str:
+    path = require_string(parameters, field)
+    return os.path.abspath(os.path.expanduser(path))
+
+
+def execute_s3_object(
+    session_id: str,
+    action: str,
+    parameters: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Execute an approved upload/download/delete operation for one S3 object."""
+
+    client = get_aws_client(
+        session_id=session_id,
+        service_name="s3",
+    )
+
+    bucket_name = validate_identifier(
+        require_string(parameters, "bucket_name"),
+        "bucket_name",
+    )
+    object_key = require_string(parameters, "object_key")
+
+    resource_identifier = f"{bucket_name}/{object_key}"
+
+    if action == "upload":
+        file_path = _validate_file_path(parameters, "file_path")
+        if not os.path.isfile(file_path):
+            raise ValueError(f"Upload file does not exist: {file_path}")
+
+        content_type = parameters.get("content_type")
+        extra_args = {"ContentType": content_type} if content_type else None
+        if extra_args:
+            client.upload_file(
+                file_path,
+                bucket_name,
+                object_key,
+                ExtraArgs=extra_args,
+            )
+        else:
+            client.upload_file(
+                file_path,
+                bucket_name,
+                object_key,
+            )
+
+        return {
+            "success": True,
+            "service": "s3",
+            "resource_type": "s3_object",
+            "action": "upload",
+            "bucket_name": bucket_name,
+            "object_key": object_key,
+            "file_path": file_path,
+            "status": "uploaded",
+        }
+
+    if action == "download":
+        file_path = _validate_file_path(parameters, "file_path")
+        parent = os.path.dirname(file_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        client.download_file(
+            bucket_name,
+            object_key,
+            file_path,
+        )
+
+        return {
+            "success": True,
+            "service": "s3",
+            "resource_type": "s3_object",
+            "action": "download",
+            "bucket_name": bucket_name,
+            "object_key": object_key,
+            "file_path": file_path,
+            "status": "downloaded",
+        }
+
+    if action == "delete":
+        require_delete_confirmation(
+            parameters,
+            resource_identifier,
+        )
+
+        client.delete_object(
+            Bucket=bucket_name,
+            Key=object_key,
+        )
+
+        return {
+            "success": True,
+            "service": "s3",
+            "resource_type": "s3_object",
+            "action": "delete",
+            "bucket_name": bucket_name,
+            "object_key": object_key,
+            "status": "deleted",
+        }
+
+    raise ValueError(
+        f"Unsupported S3 object action: {action}"
     )
 
 
@@ -563,16 +679,53 @@ def execute_rds(
             identifier,
         )
 
-        skip_final_snapshot = parameters.get(
-            "skip_final_snapshot",
-            False,
+        # AWS requires either SkipFinalSnapshot=True or a
+        # FinalDBSnapshotIdentifier when deleting an RDS instance.
+        # Never silently skip the final snapshot because that can
+        # permanently remove recoverable database data.
+        skip_final_snapshot = bool(
+            parameters.get(
+                "skip_final_snapshot",
+                False,
+            )
         )
 
+        request = {
+            "DBInstanceIdentifier": identifier,
+            "SkipFinalSnapshot": skip_final_snapshot,
+        }
+
+        if not skip_final_snapshot:
+            final_snapshot_identifier = str(
+                parameters.get(
+                    "final_db_snapshot_identifier",
+                    "",
+                )
+            ).strip()
+
+            if not final_snapshot_identifier:
+                from datetime import datetime, timezone
+
+                safe_identifier = re.sub(
+                    r"[^a-zA-Z0-9-]",
+                    "-",
+                    identifier,
+                ).strip("-").lower()
+
+                timestamp = datetime.now(
+                    timezone.utc
+                ).strftime("%Y%m%d%H%M%S")
+
+                final_snapshot_identifier = (
+                    f"{safe_identifier}-final-{timestamp}"
+                )
+
+            request["FinalDBSnapshotIdentifier"] = (
+                final_snapshot_identifier
+            )
+
         response = client.delete_db_instance(
-            DBInstanceIdentifier=identifier,
-            SkipFinalSnapshot=bool(
-                skip_final_snapshot
-            ),
+            **request
         )
 
         return {
@@ -580,8 +733,23 @@ def execute_rds(
             "service": "rds",
             "action": "delete",
             "db_instance_identifier": identifier,
+            "final_snapshot_identifier": (
+                None
+                if skip_final_snapshot
+                else request.get(
+                    "FinalDBSnapshotIdentifier"
+                )
+            ),
+            "skip_final_snapshot": skip_final_snapshot,
             "message": (
-                "RDS deletion request submitted"
+                "RDS deletion request submitted "
+                "without a final snapshot"
+                if skip_final_snapshot
+                else (
+                    "RDS deletion request submitted "
+                    "with a final snapshot: "
+                    f"{request['FinalDBSnapshotIdentifier']}"
+                )
             ),
             "response_metadata": response.get(
                 "ResponseMetadata",

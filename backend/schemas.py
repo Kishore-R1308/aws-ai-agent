@@ -42,6 +42,11 @@ class ChatResponse(BaseModel):
     rca: Optional[str] = None
     recommendations: Optional[str] = None
 
+    # ACTION fields
+    action_plan: Optional[dict] = None
+    action_validation: Optional[str] = None
+    requires_confirmation: bool = False
+
 
 # =====================================================
 # PLAN
